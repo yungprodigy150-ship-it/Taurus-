@@ -1,0 +1,6 @@
+{
+  "name": "Taurus — Autonomous Intelligence & Operations Platform",
+  "description": "Mobile-first autonomous AI operations platform for creating businesses, developing software, managing projects, coordinating AI agents, and executing digital tasks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
