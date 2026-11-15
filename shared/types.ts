@@ -18,7 +18,11 @@ export type DivisionCode =
   | 'TREASURY';
 
 export type AgentStatus = 'standby' | 'configured' | 'active' | 'disabled';
-export type AgentRuntimeMode = 'architecture_only' | 'intake_assisted' | 'autonomous_pending';
+export type AgentRuntimeMode =
+  | 'architecture_only'
+  | 'intake_assisted'
+  | 'ai_orchestrated'
+  | 'autonomous_pending';
 
 export interface AgentRecord {
   id: string;
@@ -33,6 +37,7 @@ export interface AgentRecord {
   capabilities: string[];
   config: Record<string, unknown>;
   assignedTaskCount?: number;
+  completedTaskCount?: number;
   createdBy: string | null;
   createdAt: string;
   updatedAt: string;
@@ -61,8 +66,10 @@ export type CommandStatus =
   | 'queued'
   | 'analyzing'
   | 'planned'
+  | 'clarification_needed'
   | 'awaiting_approval'
   | 'running'
+  | 'partial'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -70,9 +77,12 @@ export type CommandStatus =
 export interface CommandPlanStep {
   title: string;
   division: DivisionCode;
-  phaseAvailability: 'phase_1_planned' | 'phase_2_required';
+  taskCategory: TaskCategory;
+  complexity: TaskComplexity;
+  phaseAvailability: 'phase_1_planned' | 'phase_2_executable' | 'requires_external_integration';
   requiresApproval: boolean;
   rationale: string;
+  externalActionType?: 'github_create_repo' | 'send_email' | 'browser_navigate' | null;
 }
 
 export interface CommandRecord {
@@ -87,6 +97,8 @@ export interface CommandRecord {
   progressStage: string;
   executionNote: string;
   planSteps: CommandPlanStep[];
+  clarificationQuestions?: string[];
+  latestRunId?: string | null;
   errorMessage: string | null;
   createdBy: string;
   createdByName?: string;
@@ -103,6 +115,16 @@ export type TaskStatus =
   | 'failed';
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+export type TaskCategory =
+  | 'planning'
+  | 'research'
+  | 'strategy'
+  | 'coding'
+  | 'financial'
+  | 'monitoring'
+  | 'integration'
+  | 'general';
+export type TaskComplexity = 'low' | 'medium' | 'high';
 
 export interface TaskRecord {
   id: string;
@@ -125,11 +147,34 @@ export interface TaskRecord {
   updatedAt: string;
 }
 
-export type VentureStatus = 'draft' | 'architected' | 'ready_for_phase_2';
+export type VentureStatus =
+  | 'idea_generated'
+  | 'research_completed'
+  | 'blueprint_created'
+  | 'product_developed'
+  | 'product_deployed'
+  | 'business_operational'
+  // Preserve Phase 1 legacy values safely
+  | 'draft'
+  | 'architected'
+  | 'ready_for_phase_2';
+
+export interface VentureStructuredSpec {
+  businessConcept: string;
+  targetAudience: string;
+  marketOpportunity: string;
+  productRequirements: string[];
+  revenueModel: string;
+  operationalRequirements: string[];
+  initialDevelopmentTasks: Array<{ title: string; division: DivisionCode; description: string }>;
+  growthStrategy: string;
+  financialConsiderations: string;
+}
 
 export interface VentureRecord {
   id: string;
   name: string;
+  sourceIdea?: string;
   targetMarket: string;
   productType: string;
   revenueModel: string;
@@ -138,6 +183,9 @@ export interface VentureRecord {
   projectName?: string | null;
   status: VentureStatus;
   blueprintMarkdown: string;
+  structuredSpec?: VentureStructuredSpec | null;
+  approvedAt?: string | null;
+  approvedBy?: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -162,9 +210,12 @@ export interface CreationRecord {
   projectId: string | null;
   projectName?: string | null;
   commandId: string | null;
+  executionRunId?: string | null;
   contentType: CreationContentType;
   contentBody: string;
   libraryFileId: string | null;
+  deployedUrl?: string | null;
+  isInteractive?: boolean;
   status: 'draft' | 'ready' | 'archived';
   createdBy: string;
   createdAt: string;
@@ -205,6 +256,8 @@ export type IntegrationProviderKey =
   | 'browser_automation'
   | 'external_apis';
 
+export type AiProviderKey = 'google_gemini' | 'groq' | 'openai';
+
 export type ConnectionStatus =
   | 'not_configured'
   | 'configured_untested'
@@ -221,11 +274,113 @@ export interface IntegrationRecord {
   hasCredential: boolean;
   credentialSource: 'environment' | 'encrypted_vault' | 'none';
   config: Record<string, string>;
+  discoveredModels?: string[];
   accountLabel: string | null;
   lastTestedAt: string | null;
   lastLatencyMs: number | null;
   lastError: string | null;
   updatedAt: string;
+}
+
+export interface RoutingPolicy {
+  preferredProvider: AiProviderKey | 'auto';
+  fallbackOrder: AiProviderKey[];
+  preferCostEfficiency: boolean;
+  tierModels: {
+    fast: Partial<Record<AiProviderKey, string>>;
+    reasoning: Partial<Record<AiProviderKey, string>>;
+    coding: Partial<Record<AiProviderKey, string>>;
+  };
+}
+
+export type ExecutionRunStatus =
+  | 'planning'
+  | 'clarification_needed'
+  | 'awaiting_approval'
+  | 'running'
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | 'cancelled';
+
+export type ExecutionStepStatus =
+  | 'pending'
+  | 'awaiting_approval'
+  | 'waiting_ai'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'skipped';
+
+export interface ExecutionStepRecord {
+  id: string;
+  runId: string;
+  stepIndex: number;
+  division: DivisionCode;
+  agentId: string | null;
+  agentName?: string | null;
+  taskId: string | null;
+  title: string;
+  objective: string;
+  taskCategory: TaskCategory;
+  complexity: TaskComplexity;
+  providerKey: string | null;
+  modelName: string | null;
+  routingReason: string | null;
+  status: ExecutionStepStatus;
+  requiresApproval: boolean;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  inputSummary: string;
+  outputSummary: string;
+  outputCreationId: string | null;
+  outputFileId: string | null;
+  tokensUsed: number;
+  latencyMs: number | null;
+  retryCount: number;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface ExecutionRunRecord {
+  id: string;
+  commandId: string;
+  projectId: string | null;
+  originalInstruction: string;
+  interpretedObjective: string;
+  assignedDivisions: DivisionCode[];
+  currentStage: string;
+  status: ExecutionRunStatus;
+  finalReport: string | null;
+  remainingWork: string | null;
+  errorMessage: string | null;
+  totalTokens: number;
+  retryCount: number;
+  startedAt: string;
+  completedAt: string | null;
+  createdBy: string;
+  steps: ExecutionStepRecord[];
+}
+
+export interface AiExecutionAuditRecord {
+  id: string;
+  runId: string | null;
+  stepId: string | null;
+  division: string;
+  taskCategory: string;
+  complexity: string;
+  providerKey: string;
+  modelName: string;
+  routingReason: string;
+  fallbackUsed: boolean;
+  status: 'success' | 'error';
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  errorMessage: string | null;
+  createdAt: string;
 }
 
 export type LogLevel = 'info' | 'success' | 'warn' | 'error';
@@ -248,6 +403,7 @@ export interface OverviewPayload {
     health: 'operational' | 'degraded';
     databaseConnected: boolean;
     storageAvailable: boolean;
+    storageDurability: 'local_container_disk';
     verifiedProviders: number;
     phaseLabel: string;
   };
@@ -262,7 +418,9 @@ export interface OverviewPayload {
     totalCommands: number;
     totalCreations: number;
     totalLibraryFiles: number;
+    totalExecutionRuns: number;
   };
   pendingApprovals: TaskRecord[];
+  recentRuns: ExecutionRunRecord[];
   recentActivity: ExecutionLogRecord[];
 }

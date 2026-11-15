@@ -37,7 +37,7 @@ function mapFile(r: Record<string, unknown>): LibraryFileRecord {
   };
 }
 
-libraryRouter.get('/', (req, res) => {
+libraryRouter.get('/', (req: AuthenticatedRequest, res) => {
   const category = typeof req.query.category === 'string' ? req.query.category : null;
   const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : null;
   const db = getDb();
@@ -51,6 +51,10 @@ libraryRouter.get('/', (req, res) => {
   const conditions: string[] = [];
   const params: string[] = [];
 
+  if (req.user!.role !== 'owner') {
+    conditions.push('lf.uploaded_by = ?');
+    params.push(req.user!.id);
+  }
   if (category && VALID_CATEGORIES.includes(category as LibraryCategory)) {
     conditions.push('lf.category = ?');
     params.push(category);
@@ -68,7 +72,6 @@ libraryRouter.get('/', (req, res) => {
   res.json({ files: rows.map(mapFile) });
 });
 
-// Binary upload endpoint using express.raw up to 25MB
 libraryRouter.post(
   '/upload',
   requireRole(['owner', 'operator']),
@@ -138,7 +141,6 @@ libraryRouter.post(
   }
 );
 
-// Create text/code file directly from UI
 libraryRouter.post('/text', requireRole(['owner', 'operator']), (req: AuthenticatedRequest, res) => {
   const { filename, content, category, projectId, description } = req.body as {
     filename?: string;
@@ -213,12 +215,12 @@ libraryRouter.post('/text', requireRole(['owner', 'operator']), (req: Authentica
   res.status(201).json({ file: mapFile(row) });
 });
 
-libraryRouter.get('/:id/content', (req, res) => {
+libraryRouter.get('/:id/content', (req: AuthenticatedRequest, res) => {
   const db = getDb();
   const row = db.prepare('SELECT * FROM library_files WHERE id = ?').get(req.params.id) as
-    | { original_name: string; storage_name: string; mime_type: string }
+    | { original_name: string; storage_name: string; mime_type: string; uploaded_by: string }
     | undefined;
-  if (!row) {
+  if (!row || (req.user!.role !== 'owner' && row.uploaded_by !== req.user!.id)) {
     res.status(404).json({ error: 'Library file not found.' });
     return;
   }
@@ -232,12 +234,12 @@ libraryRouter.get('/:id/content', (req, res) => {
   }
 });
 
-libraryRouter.get('/:id/download', (req, res) => {
+libraryRouter.get('/:id/download', (req: AuthenticatedRequest, res) => {
   const db = getDb();
   const row = db.prepare('SELECT * FROM library_files WHERE id = ?').get(req.params.id) as
-    | { original_name: string; storage_name: string; mime_type: string }
+    | { original_name: string; storage_name: string; mime_type: string; uploaded_by: string }
     | undefined;
-  if (!row) {
+  if (!row || (req.user!.role !== 'owner' && row.uploaded_by !== req.user!.id)) {
     res.status(404).json({ error: 'Library file not found.' });
     return;
   }
@@ -251,10 +253,10 @@ libraryRouter.get('/:id/download', (req, res) => {
 
 libraryRouter.delete('/:id', requireRole(['owner', 'operator']), (req: AuthenticatedRequest, res) => {
   const db = getDb();
-  const row = db.prepare('SELECT original_name, storage_name FROM library_files WHERE id = ?').get(req.params.id) as
-    | { original_name: string; storage_name: string }
-    | undefined;
-  if (!row) {
+  const row = db
+    .prepare('SELECT original_name, storage_name, uploaded_by FROM library_files WHERE id = ?')
+    .get(req.params.id) as { original_name: string; storage_name: string; uploaded_by: string } | undefined;
+  if (!row || (req.user!.role !== 'owner' && row.uploaded_by !== req.user!.id)) {
     res.status(404).json({ error: 'Library file not found.' });
     return;
   }

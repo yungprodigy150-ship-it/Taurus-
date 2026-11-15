@@ -13,7 +13,17 @@ export function StatusText({ status, label }: StatusTextProps) {
       .replace(/_/g, ' ')
       .replace(/\b\w/g, (c) => c.toUpperCase());
 
-  if (s === 'connected' || s === 'completed' || s === 'active' || s === 'operational' || s === 'ready' || s === 'success') {
+  if (
+    s === 'connected' ||
+    s === 'completed' ||
+    s === 'active' ||
+    s === 'operational' ||
+    s === 'ready' ||
+    s === 'success' ||
+    s === 'sent' ||
+    s === 'product_deployed' ||
+    s === 'business_operational'
+  ) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400 whitespace-nowrap">
         <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -22,7 +32,15 @@ export function StatusText({ status, label }: StatusTextProps) {
     );
   }
 
-  if (s === 'awaiting_approval' || s === 'configured_untested' || s === 'paused' || s === 'degraded' || s === 'warn') {
+  if (
+    s === 'awaiting_approval' ||
+    s === 'clarification_needed' ||
+    s === 'configured_untested' ||
+    s === 'paused' ||
+    s === 'degraded' ||
+    s === 'partial' ||
+    s === 'warn'
+  ) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-400 whitespace-nowrap">
         <AlertTriangle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -40,7 +58,7 @@ export function StatusText({ status, label }: StatusTextProps) {
     );
   }
 
-  if (s === 'analyzing' || s === 'running' || s === 'in_progress') {
+  if (s === 'analyzing' || s === 'running' || s === 'in_progress' || s === 'waiting_ai' || s === 'planning') {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-400 whitespace-nowrap">
         <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" aria-hidden="true" />
@@ -49,7 +67,7 @@ export function StatusText({ status, label }: StatusTextProps) {
     );
   }
 
-  if (s === 'disabled' || s === 'archived' || s === 'cancelled' || s === 'not_configured') {
+  if (s === 'disabled' || s === 'archived' || s === 'cancelled' || s === 'not_configured' || s === 'skipped') {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 whitespace-nowrap">
         <CircleSlash className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />

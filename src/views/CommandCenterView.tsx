@@ -1,6 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { ChevronDown, ChevronUp, Play, Send, Sparkles } from 'lucide-react';
-import type { AgentRecord, CommandRecord, IntegrationRecord, ProjectRecord, TaskRecord, UserRole } from '../../shared/types.ts';
+import { ChevronDown, ChevronUp, Cpu, Play, Send, Sparkles } from 'lucide-react';
+import type {
+  AgentRecord,
+  CommandRecord,
+  ExecutionRunRecord,
+  IntegrationRecord,
+  ProjectRecord,
+  TaskRecord,
+  UserRole,
+} from '../../shared/types.ts';
 import { StatusText } from '../components/StatusText.tsx';
 import { api, ApiError, formatTimestamp } from '../lib/api.ts';
 
@@ -12,19 +20,21 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
   const [commands, setCommands] = useState<CommandRecord[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [agents, setAgents] = useState<AgentRecord[]>([]);
-  const [geminiConnected, setGeminiConnected] = useState(false);
+  const [connectedAiCount, setConnectedAiCount] = useState(0);
 
   const [prompt, setPrompt] = useState('');
   const [projectId, setProjectId] = useState<string>('');
   const [assignedAgentId, setAssignedAgentId] = useState<string>('');
-  const [runAiIntake, setRunAiIntake] = useState(true);
+  const [autoExecute, setAutoExecute] = useState(true);
 
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [expandedCmdId, setExpandedCmdId] = useState<string | null>(null);
+  const [cmdRuns, setCmdRuns] = useState<Record<string, ExecutionRunRecord | null>>({});
   const [cmdTasks, setCmdTasks] = useState<Record<string, TaskRecord[]>>({});
+  const [clarifyInputs, setClarifyInputs] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const canMutate = userRole === 'owner' || userRole === 'operator';
@@ -41,8 +51,10 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
       setCommands(cmdRes.commands);
       setProjects(prjRes.projects.filter((p) => p.status !== 'archived'));
       setAgents(agtRes.agents);
-      const gemini = intRes.integrations.find((i: IntegrationRecord) => i.providerKey === 'google_gemini');
-      setGeminiConnected(gemini?.connectionStatus === 'connected');
+      const aiReady = intRes.integrations.filter(
+        (i: IntegrationRecord) => i.category === 'ai_provider' && i.connectionStatus === 'connected'
+      ).length;
+      setConnectedAiCount(aiReady);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to load command history.');
     } finally {
@@ -54,12 +66,13 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
     void loadAll();
   }, []);
 
-  async function loadCommandTasks(commandId: string) {
+  async function loadCommandDetails(commandId: string) {
     try {
-      const res = await api.commands.tasks(commandId);
-      setCmdTasks((prev) => ({ ...prev, [commandId]: res.tasks }));
+      const [runRes, tasksRes] = await Promise.all([api.commands.run(commandId), api.commands.tasks(commandId)]);
+      setCmdRuns((prev) => ({ ...prev, [commandId]: runRes.executionRun }));
+      setCmdTasks((prev) => ({ ...prev, [commandId]: tasksRes.tasks }));
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Failed to load command tasks.');
+      setError(err instanceof ApiError ? err.message : 'Failed to load execution run details.');
     }
   }
 
@@ -69,7 +82,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
       return;
     }
     setExpandedCmdId(commandId);
-    await loadCommandTasks(commandId);
+    await loadCommandDetails(commandId);
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -82,12 +95,14 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
         prompt: prompt.trim(),
         projectId: projectId || null,
         assignedAgentId: assignedAgentId || null,
-        runAiIntake,
+        autoExecute,
+        runAiIntake: true,
       });
       setPrompt('');
       setCommands((prev) => [res.command, ...prev]);
+      setCmdRuns((prev) => ({ ...prev, [res.command.id]: res.executionRun }));
       setExpandedCmdId(res.command.id);
-      await loadCommandTasks(res.command.id);
+      await loadCommandDetails(res.command.id);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to submit directive.');
     } finally {
@@ -95,21 +110,66 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
     }
   }
 
-  async function handleAnalyze(commandId: string) {
+  async function handlePlanOrExecute(commandId: string, mode: 'analyze' | 'execute') {
     setBusyId(commandId);
     setError(null);
     try {
-      const res = await api.commands.analyze(commandId);
+      const res =
+        mode === 'analyze'
+          ? await api.commands.analyze(commandId, autoExecute)
+          : await api.commands.execute(commandId);
       setCommands((prev) => prev.map((c) => (c.id === commandId ? res.command : c)));
-      await loadCommandTasks(commandId);
+      setCmdRuns((prev) => ({ ...prev, [commandId]: res.executionRun }));
+      setExpandedCmdId(commandId);
+      await loadCommandDetails(commandId);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Analysis failed.');
+      setError(err instanceof ApiError ? err.message : 'Execution request failed.');
     } finally {
       setBusyId(null);
     }
   }
 
-  async function handleStatusUpdate(commandId: string, status: CommandRecord['status'], progressPercent: number, progressStage: string) {
+  async function handleClarifySubmit(e: FormEvent, commandId: string) {
+    e.preventDefault();
+    const answer = (clarifyInputs[commandId] || '').trim();
+    if (!answer) return;
+    setBusyId(commandId);
+    setError(null);
+    try {
+      const res = await api.commands.clarify(commandId, answer, autoExecute);
+      setClarifyInputs((prev) => ({ ...prev, [commandId]: '' }));
+      setCommands((prev) => prev.map((c) => (c.id === commandId ? res.command : c)));
+      setCmdRuns((prev) => ({ ...prev, [commandId]: res.executionRun }));
+      await loadCommandDetails(commandId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Failed to process clarification.');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleStepDecision(commandId: string, stepId: string, decision: 'approve' | 'reject') {
+    setBusyId(stepId);
+    setError(null);
+    try {
+      const res = await api.commands.decideStep(stepId, decision);
+      setCmdRuns((prev) => ({ ...prev, [commandId]: res.executionRun }));
+      const cmdList = await api.commands.list();
+      setCommands(cmdList.commands);
+      await loadCommandDetails(commandId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Failed to process step approval.');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleStatusUpdate(
+    commandId: string,
+    status: CommandRecord['status'],
+    progressPercent: number,
+    progressStage: string
+  ) {
     setBusyId(commandId);
     setError(null);
     try {
@@ -127,7 +187,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
     setError(null);
     try {
       await api.commands.decideTask(taskId, decision);
-      await loadCommandTasks(commandId);
+      await loadCommandDetails(commandId);
       const cmdRes = await api.commands.list();
       setCommands(cmdRes.commands);
     } catch (err) {
@@ -139,18 +199,20 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
 
   return (
     <div className="space-y-8">
-      {/* Directive Intake Composer */}
+      {/* Directive Composer */}
       <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] p-5 sm:p-6">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
           <div>
-            <h2 className="font-display text-lg font-semibold text-white">Directive Intake</h2>
+            <h2 className="font-display text-lg font-semibold text-white">Autonomous Command Center</h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              {geminiConnected
-                ? 'Google Gemini is verified. Directives can be decomposed into structured division tasks.'
-                : 'Intake queues directives persistently. Verify Google Gemini in Integrations to enable AI task planning.'}
+              {connectedAiCount > 0
+                ? `${connectedAiCount} verified AI provider${connectedAiCount > 1 ? 's' : ''} connected. TAURUS interprets objectives, selects optimal models, delegates to divisions, and executes workflows.`
+                : 'No verified AI provider connected. Verify Gemini, Groq, or OpenAI in Integrations to execute directives.'}
             </p>
           </div>
-          <span className="text-xs font-mono text-slate-400 whitespace-nowrap">Phase 1 · Intake & Planning</span>
+          <span className="text-xs font-mono text-slate-400 whitespace-nowrap">
+            Orchestration Engine · Live
+          </span>
         </div>
 
         {error && (
@@ -171,7 +233,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
               disabled={!canMutate || submitting}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder='Example: "Research and create an online business selling digital products internationally."'
+              placeholder='Example: "Build an interactive SaaS landing page and pricing calculator for a Nordic cybersecurity compliance tool, plus prepare a go-to-market plan."'
               className="w-full rounded-xl bg-[#0A0D12] border border-white/[0.1] px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-[#3B82F6] resize-y"
             />
           </div>
@@ -199,7 +261,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
 
             <div>
               <label htmlFor="cmd-agent" className="block text-xs text-slate-400 mb-1">
-                Route to Division / Agent
+                Primary Division / Agent
               </label>
               <select
                 id="cmd-agent"
@@ -208,7 +270,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                 disabled={!canMutate}
                 className="w-full h-11 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-sm text-white focus:outline-none focus:border-[#3B82F6]"
               >
-                <option value="">Auto-route by intake</option>
+                <option value="">Auto-delegate across divisions</option>
                 {agents.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.division} · {a.name}
@@ -221,12 +283,12 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
               <label className="w-full h-11 px-3.5 rounded-xl bg-[#0A0D12] border border-white/[0.1] flex items-center justify-between gap-2 text-xs text-slate-300 cursor-pointer">
                 <span className="inline-flex items-center gap-2">
                   <Sparkles className="w-3.5 h-3.5 text-[#3B82F6]" />
-                  <span>AI Task Breakdown</span>
+                  <span>Plan & Execute Immediately</span>
                 </span>
                 <input
                   type="checkbox"
-                  checked={runAiIntake}
-                  onChange={(e) => setRunAiIntake(e.target.checked)}
+                  checked={autoExecute}
+                  onChange={(e) => setAutoExecute(e.target.checked)}
                   className="accent-[#2563EB] w-4 h-4"
                 />
               </label>
@@ -236,7 +298,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
             <span className="text-xs text-slate-500">
               {canMutate
-                ? 'Commands are saved persistently. Autonomous multi-agent execution activates in Phase 2.'
+                ? 'External actions (GitHub repo creation, outbound email) automatically pause for Owner approval.'
                 : 'Viewer role: read-only access.'}
             </span>
             <button
@@ -245,16 +307,24 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
               className="min-h-[44px] px-5 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-white text-sm font-medium inline-flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
             >
               <Send className="w-4 h-4" />
-              <span>{submitting ? 'Recording Directive...' : 'Submit Directive'}</span>
+              <span>
+                {submitting
+                  ? autoExecute
+                    ? 'Orchestrating Execution...'
+                    : 'Generating Plan...'
+                  : autoExecute
+                    ? 'Plan & Execute Directive'
+                    : 'Generate Plan Only'}
+              </span>
             </button>
           </div>
         </form>
       </section>
 
-      {/* Command History */}
+      {/* Command History & Live Run Monitor */}
       <section className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="font-display text-base font-semibold text-white">Command History</h3>
+          <h3 className="font-display text-base font-semibold text-white">Directives & Execution Monitor</h3>
           <span className="text-xs font-mono text-slate-400 tabular-nums">{commands.length} recorded</span>
         </div>
 
@@ -264,14 +334,16 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
           <div className="rounded-2xl bg-[#11161F] border border-white/[0.08] p-8 text-center">
             <p className="text-sm text-slate-300">No directives have been submitted yet.</p>
             <p className="text-xs text-slate-500 mt-1">
-              Enter an instruction above to record it, associate a project, and structure operational tasks.
+              Enter an instruction in plain language above to plan, delegate, and execute real work.
             </p>
           </div>
         ) : (
           <div className="rounded-2xl bg-[#11161F] border border-white/[0.08] divide-y divide-white/[0.06] overflow-hidden">
             {commands.map((cmd) => {
               const isExpanded = expandedCmdId === cmd.id;
+              const run = cmdRuns[cmd.id] || null;
               const tasks = cmdTasks[cmd.id] || [];
+
               return (
                 <div key={cmd.id} className="p-5 space-y-3">
                   <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
@@ -283,7 +355,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                         {cmd.assignedDivision && (
                           <>
                             <span aria-hidden="true">·</span>
-                            <span>{cmd.assignedDivision}</span>
+                            <span className="font-mono">{cmd.assignedDivision}</span>
                           </>
                         )}
                         {cmd.projectName && (
@@ -300,11 +372,9 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                       <p className="mt-1 text-xs text-slate-400">{cmd.progressStage}</p>
 
                       {cmd.executionNote && (
-                        <p className="mt-2 text-xs text-slate-300 leading-relaxed">{cmd.executionNote}</p>
+                        <p className="mt-2 text-xs text-slate-300 leading-relaxed whitespace-pre-wrap">{cmd.executionNote}</p>
                       )}
-                      {cmd.errorMessage && (
-                        <p className="mt-2 text-xs text-rose-400">Error: {cmd.errorMessage}</p>
-                      )}
+                      {cmd.errorMessage && <p className="mt-2 text-xs text-rose-400">Error: {cmd.errorMessage}</p>}
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -312,11 +382,22 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                         <button
                           type="button"
                           disabled={busyId === cmd.id}
-                          onClick={() => handleAnalyze(cmd.id)}
-                          className="min-h-[38px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                          onClick={() => handlePlanOrExecute(cmd.id, 'analyze')}
+                          className="min-h-[40px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
                         >
                           <Play className="w-3.5 h-3.5" />
-                          <span>Run AI Intake</span>
+                          <span>Plan & Execute</span>
+                        </button>
+                      )}
+                      {canMutate && (cmd.status === 'planned' || cmd.status === 'partial' || cmd.status === 'failed') && (
+                        <button
+                          type="button"
+                          disabled={busyId === cmd.id}
+                          onClick={() => handlePlanOrExecute(cmd.id, 'execute')}
+                          className="min-h-[40px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Play className="w-3.5 h-3.5" />
+                          <span>{busyId === cmd.id ? 'Executing...' : 'Execute Pending Steps'}</span>
                         </button>
                       )}
                       {canMutate && cmd.status !== 'cancelled' && cmd.status !== 'completed' && (
@@ -324,7 +405,7 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                           type="button"
                           disabled={busyId === cmd.id}
                           onClick={() => handleStatusUpdate(cmd.id, 'cancelled', cmd.progressPercent, 'Cancelled by operator')}
-                          className="min-h-[38px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-400 cursor-pointer"
+                          className="min-h-[40px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-400 cursor-pointer"
                         >
                           Cancel
                         </button>
@@ -332,9 +413,9 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                       <button
                         type="button"
                         onClick={() => handleToggleExpand(cmd.id)}
-                        className="min-h-[38px] px-3 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                        className="min-h-[40px] px-3 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
                       >
-                        <span>Tasks & Plan</span>
+                        <span>Execution Details</span>
                         {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                       </button>
                     </div>
@@ -348,78 +429,217 @@ export function CommandCenterView({ userRole }: CommandCenterViewProps) {
                           ? 'bg-rose-500'
                           : cmd.status === 'completed'
                             ? 'bg-emerald-500'
-                            : 'bg-[#3B82F6]'
+                            : cmd.status === 'partial' || cmd.status === 'awaiting_approval' || cmd.status === 'clarification_needed'
+                              ? 'bg-amber-500'
+                              : 'bg-[#3B82F6]'
                       }`}
                       style={{ width: `${cmd.progressPercent}%` }}
                     />
                   </div>
 
-                  {/* Expanded Structured Tasks */}
-                  {isExpanded && (
-                    <div className="pt-3 border-t border-white/[0.06] space-y-2.5">
-                      <div className="text-xs font-medium text-slate-300">
-                        Associated Tasks ({tasks.length})
+                  {/* Clarification Prompt if Critical Info Missing */}
+                  {cmd.status === 'clarification_needed' && cmd.clarificationQuestions && cmd.clarificationQuestions.length > 0 && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 space-y-3">
+                      <div className="text-xs font-semibold text-amber-200">
+                        Clarification Needed Before Execution
                       </div>
-                      {tasks.length === 0 ? (
-                        <p className="text-xs text-slate-500">
-                          No decomposed tasks attached yet. Run AI Intake (with Gemini verified) or assign tasks from the Agents section.
-                        </p>
-                      ) : (
-                        <div className="divide-y divide-white/[0.06] rounded-xl border border-white/[0.06] bg-[#0A0D12]">
-                          {tasks.map((t) => (
-                            <div key={t.id} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                                  <StatusText status={t.status} />
-                                  <span aria-hidden="true">·</span>
-                                  <span>{t.division || 'COMMAND'}</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>Priority: {t.priority}</span>
+                      <ul className="list-disc pl-5 space-y-1 text-xs text-amber-100">
+                        {cmd.clarificationQuestions.map((q, idx) => (
+                          <li key={idx}>{q}</li>
+                        ))}
+                      </ul>
+                      {canMutate && (
+                        <form onSubmit={(e) => handleClarifySubmit(e, cmd.id)} className="flex flex-col sm:flex-row gap-2">
+                          <input
+                            type="text"
+                            required
+                            value={clarifyInputs[cmd.id] || ''}
+                            onChange={(e) => setClarifyInputs((prev) => ({ ...prev, [cmd.id]: e.target.value }))}
+                            placeholder="Provide the missing details..."
+                            className="flex-1 h-10 px-3 rounded-lg bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                          />
+                          <button
+                            type="submit"
+                            disabled={busyId === cmd.id}
+                            className="min-h-[40px] px-4 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white cursor-pointer"
+                          >
+                            {busyId === cmd.id ? 'Processing...' : 'Submit & Run'}
+                          </button>
+                        </form>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Expanded Execution Run Monitor & Tasks */}
+                  {isExpanded && (
+                    <div className="pt-4 border-t border-white/[0.06] space-y-5">
+                      {run && (
+                        <div className="space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="text-xs font-semibold text-slate-200 inline-flex items-center gap-2">
+                              <Cpu className="w-3.5 h-3.5 text-[#3B82F6]" />
+                              <span>Execution Run · {run.assignedDivisions.join(', ')}</span>
+                            </div>
+                            <span className="font-mono text-xs text-slate-400 tabular-nums">
+                              {run.totalTokens.toLocaleString()} total tokens · {run.steps.length} steps
+                            </span>
+                          </div>
+
+                          <div className="text-xs text-slate-400">
+                            Objective: <span className="text-slate-200">{run.interpretedObjective}</span>
+                          </div>
+
+                          {/* Steps List */}
+                          <div className="divide-y divide-white/[0.06] rounded-xl border border-white/[0.06] bg-[#0A0D12]">
+                            {run.steps.map((step) => (
+                              <div key={step.id} className="p-4 space-y-2">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                                    <span className="font-mono text-slate-500 tabular-nums">#{step.stepIndex + 1}</span>
+                                    <span className="font-mono text-slate-200">{step.division}</span>
+                                    <span aria-hidden="true">·</span>
+                                    <StatusText status={step.status} />
+                                    {step.providerKey && step.modelName && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono text-blue-300">
+                                          {step.providerKey}/{step.modelName}
+                                        </span>
+                                      </>
+                                    )}
+                                    {step.tokensUsed > 0 && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono tabular-nums">{step.tokensUsed} tok</span>
+                                      </>
+                                    )}
+                                    {step.latencyMs !== null && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono tabular-nums">{step.latencyMs} ms</span>
+                                      </>
+                                    )}
+                                  </div>
+
+                                  {step.status === 'awaiting_approval' && userRole === 'owner' && (
+                                    <div className="flex items-center gap-2 shrink-0">
+                                      <button
+                                        type="button"
+                                        disabled={busyId === step.id}
+                                        onClick={() => handleStepDecision(cmd.id, step.id, 'approve')}
+                                        className="min-h-[36px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white cursor-pointer"
+                                      >
+                                        Approve & Resume
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={busyId === step.id}
+                                        onClick={() => handleStepDecision(cmd.id, step.id, 'reject')}
+                                        className="min-h-[36px] px-3 rounded-lg border border-white/[0.1] text-xs text-slate-300 cursor-pointer"
+                                      >
+                                        Skip
+                                      </button>
+                                    </div>
+                                  )}
                                 </div>
-                                <div className="mt-1 text-sm text-white font-medium">{t.title}</div>
-                                {t.description && (
-                                  <p className="mt-0.5 text-xs text-slate-400">{t.description}</p>
+
+                                <div className="text-sm font-medium text-white">{step.title}</div>
+                                <div className="text-xs text-slate-400">{step.objective}</div>
+                                {step.routingReason && (
+                                  <div className="text-[11px] text-slate-500">Routing: {step.routingReason}</div>
+                                )}
+                                {step.outputSummary && (
+                                  <div className="mt-2 rounded-lg bg-[#11161F] border border-white/[0.06] p-3 text-xs text-slate-200 whitespace-pre-wrap leading-relaxed">
+                                    {step.outputSummary}
+                                  </div>
+                                )}
+                                {step.errorMessage && (
+                                  <div className="text-xs text-rose-400">Step error: {step.errorMessage}</div>
                                 )}
                               </div>
+                            ))}
+                          </div>
 
-                              {canMutate && (
-                                <div className="flex items-center gap-2 shrink-0">
-                                  {t.status === 'awaiting_approval' && userRole === 'owner' && (
-                                    <>
-                                      <button
-                                        type="button"
-                                        disabled={busyId === t.id}
-                                        onClick={() => handleTaskDecision(cmd.id, t.id, 'approve')}
-                                        className="min-h-[34px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white cursor-pointer"
-                                      >
-                                        Approve
-                                      </button>
-                                      <button
-                                        type="button"
-                                        disabled={busyId === t.id}
-                                        onClick={() => handleTaskDecision(cmd.id, t.id, 'reject')}
-                                        className="min-h-[34px] px-3 rounded-lg border border-white/[0.1] text-xs text-slate-300 cursor-pointer"
-                                      >
-                                        Reject
-                                      </button>
-                                    </>
-                                  )}
-                                  {t.status === 'pending' && (
-                                    <button
-                                      type="button"
-                                      disabled={busyId === t.id}
-                                      onClick={() => handleTaskDecision(cmd.id, t.id, 'complete')}
-                                      className="min-h-[34px] px-3 rounded-lg border border-emerald-500/30 hover:bg-emerald-500/10 text-xs text-emerald-300 cursor-pointer"
-                                    >
-                                      Mark Complete
-                                    </button>
-                                  )}
-                                </div>
-                              )}
+                          {run.finalReport && (
+                            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 space-y-1.5">
+                              <div className="text-xs font-semibold text-emerald-300">Compiled Execution Report</div>
+                              <pre className="whitespace-pre-wrap font-sans text-xs text-slate-200 leading-relaxed">
+                                {run.finalReport}
+                              </pre>
                             </div>
-                          ))}
+                          )}
+
+                          {run.remainingWork && (
+                            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-3.5 text-xs text-amber-200">
+                              <span className="font-semibold">Remaining / Blocked Work: </span>
+                              {run.remainingWork}
+                            </div>
+                          )}
                         </div>
                       )}
+
+                      {/* Associated Tasks */}
+                      <div className="space-y-2">
+                        <div className="text-xs font-medium text-slate-300">Associated Tasks ({tasks.length})</div>
+                        {tasks.length === 0 ? (
+                          <p className="text-xs text-slate-500">No tasks attached to this directive.</p>
+                        ) : (
+                          <div className="divide-y divide-white/[0.06] rounded-xl border border-white/[0.06] bg-[#0A0D12]">
+                            {tasks.map((t) => (
+                              <div key={t.id} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                                    <StatusText status={t.status} />
+                                    <span aria-hidden="true">·</span>
+                                    <span>{t.division || 'COMMAND'}</span>
+                                    <span aria-hidden="true">·</span>
+                                    <span>Priority: {t.priority}</span>
+                                  </div>
+                                  <div className="mt-1 text-sm text-white font-medium">{t.title}</div>
+                                  {t.resultNotes && (
+                                    <p className="mt-1 text-xs text-slate-400 line-clamp-2">{t.resultNotes}</p>
+                                  )}
+                                </div>
+
+                                {canMutate && (
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    {t.status === 'awaiting_approval' && userRole === 'owner' && (
+                                      <>
+                                        <button
+                                          type="button"
+                                          disabled={busyId === t.id}
+                                          onClick={() => handleTaskDecision(cmd.id, t.id, 'approve')}
+                                          className="min-h-[36px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white cursor-pointer"
+                                        >
+                                          Approve
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={busyId === t.id}
+                                          onClick={() => handleTaskDecision(cmd.id, t.id, 'reject')}
+                                          className="min-h-[36px] px-3 rounded-lg border border-white/[0.1] text-xs text-slate-300 cursor-pointer"
+                                        >
+                                          Reject
+                                        </button>
+                                      </>
+                                    )}
+                                    {t.status === 'pending' && (
+                                      <button
+                                        type="button"
+                                        disabled={busyId === t.id}
+                                        onClick={() => handleTaskDecision(cmd.id, t.id, 'complete')}
+                                        className="min-h-[36px] px-3 rounded-lg border border-emerald-500/30 hover:bg-emerald-500/10 text-xs text-emerald-300 cursor-pointer"
+                                      >
+                                        Mark Complete
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>

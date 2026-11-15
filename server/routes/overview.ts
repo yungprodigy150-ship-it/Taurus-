@@ -1,15 +1,18 @@
 import fs from 'node:fs';
 import { Router } from 'express';
-import type { ExecutionLogRecord, OverviewPayload, TaskRecord } from '../../shared/types.ts';
+import type { ExecutionLogRecord, ExecutionRunRecord, OverviewPayload, TaskRecord } from '../../shared/types.ts';
 import { STORAGE_DIR } from '../config.ts';
 import { getDb } from '../db/database.ts';
-import { requireAuth } from '../services/auth.ts';
+import { requireAuth, type AuthenticatedRequest } from '../services/auth.ts';
+import { getExecutionRunWithSteps } from '../services/orchestrator.ts';
 
 export const overviewRouter = Router();
 overviewRouter.use(requireAuth);
 
-overviewRouter.get('/', (_req, res) => {
+overviewRouter.get('/', (req: AuthenticatedRequest, res) => {
   const db = getDb();
+  const isOwner = req.user!.role === 'owner';
+  const uid = req.user!.id;
 
   let databaseConnected = true;
   try {
@@ -26,22 +29,32 @@ overviewRouter.get('/', (_req, res) => {
   const totalAgents = (db.prepare('SELECT COUNT(*) as count FROM agents').get() as { count: number }).count;
 
   const runningCommandCount = (
-    db.prepare("SELECT COUNT(*) as count FROM commands WHERE status IN ('analyzing', 'running')").get() as {
-      count: number;
-    }
-  ).count;
+    isOwner
+      ? db.prepare("SELECT COUNT(*) as count FROM commands WHERE status IN ('analyzing', 'running')").get()
+      : db
+          .prepare("SELECT COUNT(*) as count FROM commands WHERE created_by = ? AND status IN ('analyzing', 'running')")
+          .get(uid)
+  ) as { count: number };
+
   const inProgressTaskCount = (
-    db.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'in_progress'").get() as { count: number }
-  ).count;
-  const runningTasks = runningCommandCount + inProgressTaskCount;
+    isOwner
+      ? db.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'in_progress'").get()
+      : db.prepare("SELECT COUNT(*) as count FROM tasks WHERE created_by = ? AND status = 'in_progress'").get(uid)
+  ) as { count: number };
+
+  const runningTasks = runningCommandCount.count + inProgressTaskCount.count;
 
   const completedTasks = (
-    db.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'completed'").get() as { count: number }
-  ).count;
+    isOwner
+      ? db.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'completed'").get()
+      : db.prepare("SELECT COUNT(*) as count FROM tasks WHERE created_by = ? AND status = 'completed'").get(uid)
+  ) as { count: number };
 
   const activeProjects = (
-    db.prepare("SELECT COUNT(*) as count FROM projects WHERE status = 'active'").get() as { count: number }
-  ).count;
+    isOwner
+      ? db.prepare("SELECT COUNT(*) as count FROM projects WHERE status = 'active'").get()
+      : db.prepare("SELECT COUNT(*) as count FROM projects WHERE owner_id = ? AND status = 'active'").get(uid)
+  ) as { count: number };
 
   const connectedAiProviders = (
     db
@@ -61,21 +74,55 @@ overviewRouter.get('/', (_req, res) => {
     }
   ).count;
 
-  const totalCommands = (db.prepare('SELECT COUNT(*) as count FROM commands').get() as { count: number }).count;
-  const totalCreations = (db.prepare('SELECT COUNT(*) as count FROM creations').get() as { count: number }).count;
-  const totalLibraryFiles = (db.prepare('SELECT COUNT(*) as count FROM library_files').get() as { count: number }).count;
+  const totalCommands = (
+    isOwner
+      ? db.prepare('SELECT COUNT(*) as count FROM commands').get()
+      : db.prepare('SELECT COUNT(*) as count FROM commands WHERE created_by = ?').get(uid)
+  ) as { count: number };
 
-  const approvalRows = db
-    .prepare(`
-      SELECT t.*, p.name as project_name, a.name as agent_name
-      FROM tasks t
-      LEFT JOIN projects p ON p.id = t.project_id
-      LEFT JOIN agents a ON a.id = t.agent_id
-      WHERE t.status = 'awaiting_approval'
-      ORDER BY t.created_at DESC
-      LIMIT 20
-    `)
-    .all() as Array<Record<string, unknown>>;
+  const totalCreations = (
+    isOwner
+      ? db.prepare('SELECT COUNT(*) as count FROM creations').get()
+      : db.prepare('SELECT COUNT(*) as count FROM creations WHERE created_by = ?').get(uid)
+  ) as { count: number };
+
+  const totalLibraryFiles = (
+    isOwner
+      ? db.prepare('SELECT COUNT(*) as count FROM library_files').get()
+      : db.prepare('SELECT COUNT(*) as count FROM library_files WHERE uploaded_by = ?').get(uid)
+  ) as { count: number };
+
+  const totalExecutionRuns = (
+    isOwner
+      ? db.prepare('SELECT COUNT(*) as count FROM execution_runs').get()
+      : db.prepare('SELECT COUNT(*) as count FROM execution_runs WHERE created_by = ?').get(uid)
+  ) as { count: number };
+
+  const approvalRows = (
+    isOwner
+      ? db
+          .prepare(`
+            SELECT t.*, p.name as project_name, a.name as agent_name
+            FROM tasks t
+            LEFT JOIN projects p ON p.id = t.project_id
+            LEFT JOIN agents a ON a.id = t.agent_id
+            WHERE t.status = 'awaiting_approval'
+            ORDER BY t.created_at DESC
+            LIMIT 20
+          `)
+          .all()
+      : db
+          .prepare(`
+            SELECT t.*, p.name as project_name, a.name as agent_name
+            FROM tasks t
+            LEFT JOIN projects p ON p.id = t.project_id
+            LEFT JOIN agents a ON a.id = t.agent_id
+            WHERE t.created_by = ? AND t.status = 'awaiting_approval'
+            ORDER BY t.created_at DESC
+            LIMIT 20
+          `)
+          .all(uid)
+  ) as Array<Record<string, unknown>>;
 
   const pendingApprovals: TaskRecord[] = approvalRows.map((r) => ({
     id: String(r.id),
@@ -98,9 +145,23 @@ overviewRouter.get('/', (_req, res) => {
     updatedAt: String(r.updated_at),
   }));
 
-  const logRows = db
-    .prepare('SELECT * FROM execution_logs ORDER BY created_at DESC LIMIT 25')
-    .all() as Array<Record<string, unknown>>;
+  const recentRunIds = (
+    isOwner
+      ? db.prepare('SELECT id FROM execution_runs ORDER BY started_at DESC LIMIT 5').all()
+      : db.prepare('SELECT id FROM execution_runs WHERE created_by = ? ORDER BY started_at DESC LIMIT 5').all(uid)
+  ) as Array<{ id: string }>;
+
+  const recentRuns: ExecutionRunRecord[] = recentRunIds
+    .map((r) => getExecutionRunWithSteps(r.id))
+    .filter((r): r is ExecutionRunRecord => Boolean(r));
+
+  const logRows = (
+    isOwner
+      ? db.prepare('SELECT * FROM execution_logs ORDER BY created_at DESC LIMIT 25').all()
+      : db
+          .prepare('SELECT * FROM execution_logs WHERE actor_id = ? OR actor_id IS NULL ORDER BY created_at DESC LIMIT 25')
+          .all(uid)
+  ) as Array<Record<string, unknown>>;
 
   const recentActivity: ExecutionLogRecord[] = logRows.map((r) => ({
     id: String(r.id),
@@ -120,22 +181,25 @@ overviewRouter.get('/', (_req, res) => {
       health: !databaseConnected || !storageAvailable || errorIntegrations > 0 ? 'degraded' : 'operational',
       databaseConnected,
       storageAvailable,
+      storageDurability: 'local_container_disk',
       verifiedProviders,
-      phaseLabel: 'Phase 1 · System Foundation',
+      phaseLabel: 'Phase 2 · Multi-Agent Orchestration',
     },
     metrics: {
       activeAgents,
       totalAgents,
       runningTasks,
-      completedTasks,
-      activeProjects,
+      completedTasks: completedTasks.count,
+      activeProjects: activeProjects.count,
       connectedAiProviders,
       pendingApprovals: pendingApprovals.length,
-      totalCommands,
-      totalCreations,
-      totalLibraryFiles,
+      totalCommands: totalCommands.count,
+      totalCreations: totalCreations.count,
+      totalLibraryFiles: totalLibraryFiles.count,
+      totalExecutionRuns: totalExecutionRuns.count,
     },
     pendingApprovals,
+    recentRuns,
     recentActivity,
   };
 

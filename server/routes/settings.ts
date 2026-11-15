@@ -4,12 +4,15 @@ import { DB_PATH, STORAGE_DIR } from '../config.ts';
 import { getDb } from '../db/database.ts';
 import { requireAuth, requireRole, type AuthenticatedRequest } from '../services/auth.ts';
 import { logEvent } from '../services/logger.ts';
+import { getRoutingPolicy, listRecentAiExecutions } from '../services/modelRouter.ts';
 
 export const settingsRouter = Router();
 settingsRouter.use(requireAuth);
 
-settingsRouter.get('/', (_req, res) => {
+settingsRouter.get('/', (req: AuthenticatedRequest, res) => {
   const db = getDb();
+  const isOwner = req.user!.role === 'owner';
+
   const policyRow = db.prepare('SELECT value_json, updated_at FROM system_settings WHERE key = ?').get('workspace_policy') as
     | { value_json: string; updated_at: string }
     | undefined;
@@ -41,11 +44,17 @@ settingsRouter.get('/', (_req, res) => {
     storageFileCount = 0;
   }
 
-  const logs = db.prepare('SELECT * FROM execution_logs ORDER BY created_at DESC LIMIT 60').all();
+  const logs = isOwner
+    ? db.prepare('SELECT * FROM execution_logs ORDER BY created_at DESC LIMIT 60').all()
+    : db
+        .prepare('SELECT * FROM execution_logs WHERE actor_id = ? OR actor_id IS NULL ORDER BY created_at DESC LIMIT 60')
+        .all(req.user!.id);
 
   res.json({
     policy,
     policyUpdatedAt: policyRow?.updated_at ?? null,
+    routingPolicy: getRoutingPolicy(),
+    aiExecutions: listRecentAiExecutions(25),
     infrastructure: {
       nodeVersion: process.version,
       databaseEngine: 'SQLite (node:sqlite WAL)',
@@ -53,6 +62,9 @@ settingsRouter.get('/', (_req, res) => {
       storageDirectory: 'data/storage',
       storageFileCount,
       storageTotalBytes,
+      storageDurability: 'local_container_disk',
+      durabilityNotice:
+        'Local SQLite and container filesystem are active. In ephemeral Cloud Run deployments without a persistent volume or external database, container redeploys reset local disk. Use Export Backup to archive workspace state.',
       encryptionAlgorithm: 'AES-256-GCM',
     },
     logs,
@@ -102,4 +114,37 @@ settingsRouter.patch('/policy', requireRole(['owner']), (req: AuthenticatedReque
   });
 
   res.json({ policy: updated, updatedAt: now });
+});
+
+// Owner-only workspace JSON backup export (strictly excludes password hashes, session tokens, and encrypted secrets)
+settingsRouter.get('/backup', requireRole(['owner']), (req: AuthenticatedRequest, res) => {
+  const db = getDb();
+  const snapshot = {
+    exportedAt: new Date().toISOString(),
+    exportedBy: req.user!.email,
+    platform: 'TAURUS Phase 2',
+    projects: db.prepare('SELECT * FROM projects').all(),
+    agents: db.prepare('SELECT * FROM agents').all(),
+    commands: db.prepare('SELECT * FROM commands').all(),
+    tasks: db.prepare('SELECT * FROM tasks').all(),
+    ventures: db.prepare('SELECT * FROM ventures').all(),
+    creations: db.prepare('SELECT * FROM creations').all(),
+    libraryFilesMetadata: db.prepare('SELECT id, original_name, category, mime_type, size_bytes, sha256, project_id, description, uploaded_by, created_at FROM library_files').all(),
+    executionRuns: db.prepare('SELECT * FROM execution_runs').all(),
+    executionSteps: db.prepare('SELECT * FROM execution_steps').all(),
+    aiExecutions: db.prepare('SELECT * FROM ai_executions').all(),
+  };
+
+  logEvent({
+    level: 'info',
+    subsystem: 'SENTRY',
+    action: 'workspace.backup_exported',
+    message: `Exported sanitized workspace JSON backup.`,
+    actorId: req.user!.id,
+    actorName: req.user!.name,
+  });
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="taurus-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+  res.send(JSON.stringify(snapshot, null, 2));
 });

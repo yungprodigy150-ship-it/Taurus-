@@ -4,17 +4,23 @@ import { getDb } from '../db/database.ts';
 import { newId } from '../db/seed.ts';
 import { requireAuth, requireRole, type AuthenticatedRequest } from '../services/auth.ts';
 import { logEvent } from '../services/logger.ts';
-import { analyzeCommandIntake } from '../services/orchestrator.ts';
+import { continueExecutionRun, getExecutionRunWithSteps, planAndRunCommand } from '../services/orchestrator.ts';
 
 export const commandsRouter = Router();
 commandsRouter.use(requireAuth);
 
 function mapCommandRow(r: Record<string, unknown>): CommandRecord {
   let planSteps: CommandPlanStep[] = [];
+  let clarificationQuestions: string[] = [];
   try {
     planSteps = JSON.parse(String(r.plan_json || '[]')) as CommandPlanStep[];
   } catch {
     planSteps = [];
+  }
+  try {
+    clarificationQuestions = JSON.parse(String(r.clarification_json || '[]')) as string[];
+  } catch {
+    clarificationQuestions = [];
   }
 
   return {
@@ -29,6 +35,8 @@ function mapCommandRow(r: Record<string, unknown>): CommandRecord {
     progressStage: String(r.progress_stage || ''),
     executionNote: String(r.execution_note || ''),
     planSteps,
+    clarificationQuestions,
+    latestRunId: r.latest_run_id ? String(r.latest_run_id) : null,
     errorMessage: r.error_message ? String(r.error_message) : null,
     createdBy: String(r.created_by),
     createdByName: r.created_by_name ? String(r.created_by_name) : undefined,
@@ -37,34 +45,47 @@ function mapCommandRow(r: Record<string, unknown>): CommandRecord {
   };
 }
 
-commandsRouter.get('/', (req, res) => {
+function assertCommandAccess(cmd: Record<string, unknown>, req: AuthenticatedRequest): boolean {
+  if (req.user!.role === 'owner') return true;
+  return String(cmd.created_by) === req.user!.id;
+}
+
+commandsRouter.get('/', (req: AuthenticatedRequest, res) => {
   const db = getDb();
   const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : null;
+  const isOwner = req.user!.role === 'owner';
 
-  const query = projectId
-    ? `SELECT c.*, p.name as project_name, u.name as created_by_name
-       FROM commands c
-       LEFT JOIN projects p ON p.id = c.project_id
-       LEFT JOIN users u ON u.id = c.created_by
-       WHERE c.project_id = ?
-       ORDER BY c.created_at DESC`
-    : `SELECT c.*, p.name as project_name, u.name as created_by_name
-       FROM commands c
-       LEFT JOIN projects p ON p.id = c.project_id
-       LEFT JOIN users u ON u.id = c.created_by
-       ORDER BY c.created_at DESC`;
+  const conditions: string[] = [];
+  const params: string[] = [];
+  if (!isOwner) {
+    conditions.push('c.created_by = ?');
+    params.push(req.user!.id);
+  }
+  if (projectId) {
+    conditions.push('c.project_id = ?');
+    params.push(projectId);
+  }
 
-  const rows = (projectId ? db.prepare(query).all(projectId) : db.prepare(query).all()) as Array<
-    Record<string, unknown>
-  >;
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const query = `
+    SELECT c.*, p.name as project_name, u.name as created_by_name
+    FROM commands c
+    LEFT JOIN projects p ON p.id = c.project_id
+    LEFT JOIN users u ON u.id = c.created_by
+    ${whereClause}
+    ORDER BY c.created_at DESC
+  `;
+
+  const rows = db.prepare(query).all(...params) as Array<Record<string, unknown>>;
   res.json({ commands: rows.map(mapCommandRow) });
 });
 
 commandsRouter.post('/', requireRole(['owner', 'operator']), async (req: AuthenticatedRequest, res) => {
-  const { prompt, projectId, assignedAgentId, runAiIntake } = req.body as {
+  const { prompt, projectId, assignedAgentId, autoExecute, runAiIntake } = req.body as {
     prompt?: string;
     projectId?: string | null;
     assignedAgentId?: string | null;
+    autoExecute?: boolean;
     runAiIntake?: boolean;
   };
 
@@ -75,9 +96,11 @@ commandsRouter.post('/', requireRole(['owner', 'operator']), async (req: Authent
 
   const db = getDb();
   if (projectId) {
-    const proj = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
-    if (!proj) {
-      res.status(404).json({ error: 'Selected project was not found.' });
+    const proj = db.prepare('SELECT id, owner_id FROM projects WHERE id = ?').get(projectId) as
+      | { id: string; owner_id: string }
+      | undefined;
+    if (!proj || (req.user!.role !== 'owner' && proj.owner_id !== req.user!.id)) {
+      res.status(404).json({ error: 'Selected project was not found or inaccessible.' });
       return;
     }
   }
@@ -101,15 +124,14 @@ commandsRouter.post('/', requireRole(['owner', 'operator']), async (req: Authent
     INSERT INTO commands (
       id, prompt, project_id, assigned_agent_id, assigned_division,
       status, progress_percent, progress_stage, execution_note,
-      plan_json, error_message, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'queued', 10, 'Intake recorded', ?, '[]', NULL, ?, ?, ?)
+      plan_json, clarification_json, latest_run_id, error_message, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'queued', 0, 'Instruction recorded', '', '[]', '[]', NULL, NULL, ?, ?, ?)
   `).run(
     commandId,
     prompt.trim(),
     projectId || null,
     assignedAgentId || null,
     assignedDivision,
-    'Instruction persisted. Autonomous execution engine is scheduled for Phase 2.',
     req.user!.id,
     now,
     now
@@ -126,8 +148,11 @@ commandsRouter.post('/', requireRole(['owner', 'operator']), async (req: Authent
     actorName: req.user!.name,
   });
 
+  let run = null;
   if (runAiIntake !== false) {
-    await analyzeCommandIntake(commandId, req.user!.id, req.user!.name);
+    run = await planAndRunCommand(commandId, req.user!.id, req.user!.name, {
+      autoExecute: autoExecute !== false,
+    });
   }
 
   const createdRow = db
@@ -140,14 +165,24 @@ commandsRouter.post('/', requireRole(['owner', 'operator']), async (req: Authent
     )
     .get(commandId) as Record<string, unknown>;
 
-  res.status(201).json({ command: mapCommandRow(createdRow) });
+  res.status(201).json({ command: mapCommandRow(createdRow), executionRun: run });
 });
 
 commandsRouter.post('/:id/analyze', requireRole(['owner', 'operator']), async (req: AuthenticatedRequest, res) => {
-  const { id } = req.params;
-  await analyzeCommandIntake(id, req.user!.id, req.user!.name);
-
   const db = getDb();
+  const existing = db.prepare('SELECT * FROM commands WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing || !assertCommandAccess(existing, req)) {
+    res.status(404).json({ error: 'Command not found.' });
+    return;
+  }
+
+  const { autoExecute } = (req.body || {}) as { autoExecute?: boolean };
+  const run = await planAndRunCommand(req.params.id, req.user!.id, req.user!.name, {
+    autoExecute: autoExecute !== false,
+  });
+
   const row = db
     .prepare(
       `SELECT c.*, p.name as project_name, u.name as created_by_name
@@ -156,14 +191,87 @@ commandsRouter.post('/:id/analyze', requireRole(['owner', 'operator']), async (r
        LEFT JOIN users u ON u.id = c.created_by
        WHERE c.id = ?`
     )
-    .get(id) as Record<string, unknown> | undefined;
+    .get(req.params.id) as Record<string, unknown>;
 
-  if (!row) {
+  res.json({ command: mapCommandRow(row), executionRun: run });
+});
+
+commandsRouter.post('/:id/clarify', requireRole(['owner', 'operator']), async (req: AuthenticatedRequest, res) => {
+  const { answer, autoExecute } = req.body as { answer?: string; autoExecute?: boolean };
+  if (!answer?.trim()) {
+    res.status(400).json({ error: 'Clarification response is required.' });
+    return;
+  }
+
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM commands WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing || !assertCommandAccess(existing, req)) {
     res.status(404).json({ error: 'Command not found.' });
     return;
   }
 
-  res.json({ command: mapCommandRow(row) });
+  const run = await planAndRunCommand(req.params.id, req.user!.id, req.user!.name, {
+    autoExecute: autoExecute !== false,
+    clarificationAnswer: answer.trim(),
+  });
+
+  const row = db
+    .prepare(
+      `SELECT c.*, p.name as project_name, u.name as created_by_name
+       FROM commands c
+       LEFT JOIN projects p ON p.id = c.project_id
+       LEFT JOIN users u ON u.id = c.created_by
+       WHERE c.id = ?`
+    )
+    .get(req.params.id) as Record<string, unknown>;
+
+  res.json({ command: mapCommandRow(row), executionRun: run });
+});
+
+commandsRouter.post('/:id/execute', requireRole(['owner', 'operator']), async (req: AuthenticatedRequest, res) => {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM commands WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing || !assertCommandAccess(existing, req)) {
+    res.status(404).json({ error: 'Command not found.' });
+    return;
+  }
+
+  let run = null;
+  if (existing.latest_run_id) {
+    run = await continueExecutionRun(String(existing.latest_run_id), req.user!.id, req.user!.name);
+  } else {
+    run = await planAndRunCommand(req.params.id, req.user!.id, req.user!.name, { autoExecute: true });
+  }
+
+  const row = db
+    .prepare(
+      `SELECT c.*, p.name as project_name, u.name as created_by_name
+       FROM commands c
+       LEFT JOIN projects p ON p.id = c.project_id
+       LEFT JOIN users u ON u.id = c.created_by
+       WHERE c.id = ?`
+    )
+    .get(req.params.id) as Record<string, unknown>;
+
+  res.json({ command: mapCommandRow(row), executionRun: run });
+});
+
+commandsRouter.get('/:id/run', (req: AuthenticatedRequest, res) => {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM commands WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing || !assertCommandAccess(existing, req)) {
+    res.status(404).json({ error: 'Command not found.' });
+    return;
+  }
+
+  const run = existing.latest_run_id ? getExecutionRunWithSteps(String(existing.latest_run_id)) : null;
+  res.json({ executionRun: run });
 });
 
 commandsRouter.patch('/:id', requireRole(['owner', 'operator']), (req: AuthenticatedRequest, res) => {
@@ -178,7 +286,7 @@ commandsRouter.patch('/:id', requireRole(['owner', 'operator']), (req: Authentic
 
   const db = getDb();
   const existing = db.prepare('SELECT * FROM commands WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-  if (!existing) {
+  if (!existing || !assertCommandAccess(existing, req)) {
     res.status(404).json({ error: 'Command not found.' });
     return;
   }
@@ -223,8 +331,16 @@ commandsRouter.patch('/:id', requireRole(['owner', 'operator']), (req: Authentic
   res.json({ command: mapCommandRow(updated) });
 });
 
-commandsRouter.get('/:id/tasks', (req, res) => {
+commandsRouter.get('/:id/tasks', (req: AuthenticatedRequest, res) => {
   const db = getDb();
+  const existing = db.prepare('SELECT id, created_by FROM commands WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing || !assertCommandAccess(existing, req)) {
+    res.status(404).json({ error: 'Command not found.' });
+    return;
+  }
+
   const rows = db
     .prepare(`
       SELECT t.*, p.name as project_name, a.name as agent_name
@@ -260,7 +376,55 @@ commandsRouter.get('/:id/tasks', (req, res) => {
   res.json({ tasks });
 });
 
-commandsRouter.post('/tasks/:taskId/decision', requireRole(['owner', 'operator']), (req: AuthenticatedRequest, res) => {
+commandsRouter.post('/steps/:stepId/decision', requireRole(['owner']), async (req: AuthenticatedRequest, res) => {
+  const { stepId } = req.params;
+  const { decision } = req.body as { decision?: 'approve' | 'reject' };
+  if (decision !== 'approve' && decision !== 'reject') {
+    res.status(400).json({ error: 'Decision must be approve or reject.' });
+    return;
+  }
+
+  const db = getDb();
+  const step = db.prepare('SELECT * FROM execution_steps WHERE id = ?').get(stepId) as
+    | { id: string; run_id: string; task_id: string | null; title: string; status: string }
+    | undefined;
+  if (!step) {
+    res.status(404).json({ error: 'Execution step not found.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const nextStepStatus = decision === 'approve' ? 'pending' : 'skipped';
+  db.prepare(`
+    UPDATE execution_steps
+    SET status = ?, approved_by = ?, approved_at = ?
+    WHERE id = ?
+  `).run(nextStepStatus, req.user!.id, now, stepId);
+
+  if (step.task_id) {
+    db.prepare(`
+      UPDATE tasks
+      SET status = ?, approved_by = ?, approved_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(decision === 'approve' ? 'pending' : 'rejected', req.user!.id, now, now, step.task_id);
+  }
+
+  logEvent({
+    level: decision === 'approve' ? 'success' : 'warn',
+    subsystem: 'COMMAND',
+    action: `step.${decision}`,
+    message: `${decision === 'approve' ? 'Approved' : 'Rejected'} gated step "${step.title}".`,
+    entityType: 'execution_step',
+    entityId: stepId,
+    actorId: req.user!.id,
+    actorName: req.user!.name,
+  });
+
+  const updatedRun = await continueExecutionRun(step.run_id, req.user!.id, req.user!.name);
+  res.json({ executionRun: updatedRun });
+});
+
+commandsRouter.post('/tasks/:taskId/decision', requireRole(['owner', 'operator']), async (req: AuthenticatedRequest, res) => {
   const { taskId } = req.params;
   const { decision, notes } = req.body as { decision?: 'approve' | 'reject' | 'complete'; notes?: string };
 
@@ -273,6 +437,10 @@ commandsRouter.post('/tasks/:taskId/decision', requireRole(['owner', 'operator']
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Record<string, unknown> | undefined;
   if (!task) {
     res.status(404).json({ error: 'Task not found.' });
+    return;
+  }
+  if (req.user!.role !== 'owner' && String(task.created_by) !== req.user!.id) {
+    res.status(403).json({ error: 'Forbidden.' });
     return;
   }
 
@@ -302,8 +470,18 @@ commandsRouter.post('/tasks/:taskId/decision', requireRole(['owner', 'operator']
     taskId
   );
 
-  // Recalculate parent command progress if linked
-  if (task.command_id) {
+  // Sync linked execution_step if present and resume run on approval
+  const linkedStep = db.prepare('SELECT id, run_id FROM execution_steps WHERE task_id = ?').get(taskId) as
+    | { id: string; run_id: string }
+    | undefined;
+
+  if (linkedStep && (decision === 'approve' || decision === 'reject')) {
+    db.prepare(`
+      UPDATE execution_steps SET status = ?, approved_by = ?, approved_at = ? WHERE id = ?
+    `).run(decision === 'approve' ? 'pending' : 'skipped', req.user!.id, now, linkedStep.id);
+
+    await continueExecutionRun(linkedStep.run_id, req.user!.id, req.user!.name);
+  } else if (task.command_id) {
     const commandId = String(task.command_id);
     const siblings = db.prepare('SELECT status FROM tasks WHERE command_id = ?').all(commandId) as Array<{
       status: string;

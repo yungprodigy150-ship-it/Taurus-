@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { DivisionCode, IntegrationProviderKey } from '../../shared/types.ts';
+import type { DivisionCode, IntegrationProviderKey, RoutingPolicy } from '../../shared/types.ts';
 import { getDb } from './database.ts';
 
 interface DivisionBlueprint {
@@ -8,6 +8,7 @@ interface DivisionBlueprint {
   division: DivisionCode;
   description: string;
   responsibilities: string;
+  capabilities: string[];
 }
 
 const FOUNDATIONAL_DIVISIONS: DivisionBlueprint[] = [
@@ -15,50 +16,71 @@ const FOUNDATIONAL_DIVISIONS: DivisionBlueprint[] = [
     id: 'div-command',
     name: 'Command Core',
     division: 'COMMAND',
-    description: 'Central coordination division responsible for instruction intake, cross-division routing, and human approval gates.',
-    responsibilities: 'Parse operator directives, break initiatives into structured task queues, enforce approval policies, and coordinate division handoffs.',
+    description:
+      'Central coordination division responsible for directive interpretation, multi-division planning, delegation, and synthesis.',
+    responsibilities:
+      'Interpret natural-language goals, assign work across specialized divisions, enforce approval gates, and compile final execution reports.',
+    capabilities: ['directive_interpretation', 'execution_planning', 'division_delegation', 'report_synthesis'],
   },
   {
     id: 'div-forge',
     name: 'Forge Foundry',
     division: 'FORGE',
-    description: 'Business and product creation division designed for venture structuring, software blueprints, and digital product packaging.',
-    responsibilities: 'Structure new ventures, generate technical and commercial specifications, and register deliverables in My Creations.',
+    description:
+      'Business, software, website, and digital product creation division generating interactive deliverables and blueprints.',
+    responsibilities:
+      'Build interactive HTML/JS websites, application architectures, venture blueprints, and store deliverables in My Creations & Library.',
+    capabilities: ['website_generation', 'application_architecture', 'venture_blueprinting', 'artifact_persistence'],
   },
   {
     id: 'div-vanguard',
     name: 'Vanguard Growth',
     division: 'VANGUARD',
-    description: 'Strategy and market growth division focused on positioning, distribution channels, and launch planning.',
-    responsibilities: 'Evaluate target markets, formulate go-to-market plans, and define acquisition metrics and channel workflows.',
+    description:
+      'Strategy, market positioning, go-to-market execution, and growth optimization division.',
+    responsibilities:
+      'Evaluate commercial opportunities, formulate acquisition strategies, and build actionable launch plans.',
+    capabilities: ['market_positioning', 'gtm_strategy', 'competitive_differentiation'],
   },
   {
     id: 'div-sentry',
     name: 'Sentry Operations',
     division: 'SENTRY',
-    description: 'Monitoring, reliability, and security oversight division for audit trails, permissions, and runtime checks.',
-    responsibilities: 'Track operational logs, enforce role-based access rules, monitor provider health, and flag failed operations.',
+    description:
+      'Monitoring, operational security, execution verification, and system health auditing division.',
+    responsibilities:
+      'Inspect execution runs, verify provider health, enforce access rules, and detect incomplete or failed operations.',
+    capabilities: ['execution_audit', 'health_diagnostics', 'security_policy_review'],
   },
   {
     id: 'div-atlas',
     name: 'Atlas Intelligence',
     division: 'ATLAS',
-    description: 'Research and market intelligence division prepared for structured synthesis and external research workflows.',
-    responsibilities: 'Organize research briefs, store market documents in the Library, and prepare competitor or domain intelligence.',
+    description:
+      'Research, competitor analysis, market intelligence, and web inspection division.',
+    responsibilities:
+      'Conduct structured opportunity & competitor research, inspect live public URLs via the Browser Adapter, and archive briefs to Library.',
+    capabilities: ['opportunity_research', 'competitor_analysis', 'web_page_inspection'],
   },
   {
     id: 'div-nexus',
     name: 'Nexus Integrations',
     division: 'NEXUS',
-    description: 'AI provider and external service gateway managing verified model providers, GitHub, email, and API adapters.',
-    responsibilities: 'Maintain encrypted provider credentials, verify live authentication states, and route AI model requests server-side.',
+    description:
+      'AI providers and external tool gateway managing GitHub repositories, email outbox, browser adapter, and model routing.',
+    responsibilities:
+      'Coordinate multi-provider AI execution, GitHub repository operations, gated email delivery, and browser adapter tasks.',
+    capabilities: ['github_operations', 'email_dispatch', 'browser_navigation', 'provider_routing'],
   },
   {
     id: 'div-treasury',
     name: 'Treasury Ledger',
     division: 'TREASURY',
-    description: 'Financial operations architecture for pricing models, unit economics, and future payment/billing integrations.',
-    responsibilities: 'Define revenue models and cost constraints during venture creation; live payment execution reserved for Phase 2+.',
+    description:
+      'Financial modeling, unit economics, pricing structure, and cost projection division.',
+    responsibilities:
+      'Develop unit economics, pricing tiers, cost estimates, and revenue projections for ventures and initiatives.',
+    capabilities: ['financial_modeling', 'pricing_analysis', 'unit_economics'],
   },
 ];
 
@@ -78,7 +100,13 @@ const BASE_INTEGRATIONS: IntegrationSeed[] = [
     displayName: 'Google Gemini',
     category: 'ai_provider',
     authType: 'env_secret',
-    config: { defaultModel: 'gemini-4-hydrogen', secretVariable: 'GEMINI_API_KEY' },
+    config: {
+      defaultModel: 'gemini-4-hydrogen',
+      fastModel: 'gemini-3.1-flash-lite',
+      reasoningModel: 'gemini-4-hydrogen',
+      codingModel: 'gemini-4-hydrogen',
+      secretVariable: 'GEMINI_API_KEY',
+    },
   },
   {
     id: 'int-groq',
@@ -86,7 +114,13 @@ const BASE_INTEGRATIONS: IntegrationSeed[] = [
     displayName: 'Groq',
     category: 'ai_provider',
     authType: 'encrypted_token',
-    config: { baseUrl: 'https://api.groq.com/openai/v1', defaultModel: 'llama-3.3-70b-versatile' },
+    config: {
+      baseUrl: 'https://api.groq.com/openai/v1',
+      defaultModel: 'llama-3.3-70b-versatile',
+      fastModel: 'llama-3.1-8b-instant',
+      reasoningModel: 'llama-3.3-70b-versatile',
+      codingModel: 'llama-3.3-70b-versatile',
+    },
   },
   {
     id: 'int-openai',
@@ -94,7 +128,13 @@ const BASE_INTEGRATIONS: IntegrationSeed[] = [
     displayName: 'OpenAI',
     category: 'ai_provider',
     authType: 'encrypted_token',
-    config: { baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-4o-mini' },
+    config: {
+      baseUrl: 'https://api.openai.com/v1',
+      defaultModel: 'gpt-4o-mini',
+      fastModel: 'gpt-4o-mini',
+      reasoningModel: 'gpt-4o',
+      codingModel: 'gpt-4o',
+    },
   },
   {
     id: 'int-github',
@@ -110,7 +150,7 @@ const BASE_INTEGRATIONS: IntegrationSeed[] = [
     displayName: 'Email Services',
     category: 'messaging',
     authType: 'encrypted_token',
-    config: { provider: 'resend', apiUrl: 'https://api.resend.com' },
+    config: { provider: 'resend', apiUrl: 'https://api.resend.com', fromAddress: '' },
   },
   {
     id: 'int-browser',
@@ -130,40 +170,99 @@ const BASE_INTEGRATIONS: IntegrationSeed[] = [
   },
 ];
 
-export function seedSystemFoundations(): void {
+export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
+  preferredProvider: 'auto',
+  fallbackOrder: ['google_gemini', 'groq', 'openai'],
+  preferCostEfficiency: true,
+  tierModels: {
+    fast: {
+      google_gemini: 'gemini-3.1-flash-lite',
+      groq: 'llama-3.1-8b-instant',
+      openai: 'gpt-4o-mini',
+    },
+    reasoning: {
+      google_gemini: 'gemini-4-hydrogen',
+      groq: 'llama-3.3-70b-versatile',
+      openai: 'gpt-4o',
+    },
+    coding: {
+      google_gemini: 'gemini-4-hydrogen',
+      groq: 'llama-3.3-70b-versatile',
+      openai: 'gpt-4o',
+    },
+  },
+};
+
+export function syncDivisionCapabilitiesAndStatus(): void {
   const db = getDb();
   const now = new Date().toISOString();
 
-  // Seed architectural division scaffolds ONLY if agents table is empty.
-  // Status is strictly 'standby' and runtime_mode is 'architecture_only' so Phase 1 never fakes autonomous execution.
-  const agentCountRow = db.prepare('SELECT COUNT(*) as count FROM agents').get() as { count: number };
-  if (agentCountRow.count === 0) {
-    const insertAgent = db.prepare(`
-      INSERT INTO agents (
-        id, name, division, description, responsibilities,
-        model_provider, model_name, status, runtime_mode,
-        capabilities_json, config_json, created_by, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-    `);
+  // Check whether at least one AI provider is genuinely verified & connected
+  const connectedAiCount = (
+    db
+      .prepare("SELECT COUNT(*) as count FROM integrations WHERE category = 'ai_provider' AND connection_status = 'connected'")
+      .get() as { count: number }
+  ).count;
 
-    for (const div of FOUNDATIONAL_DIVISIONS) {
-      insertAgent.run(
+  const hasVerifiedAi = connectedAiCount > 0;
+
+  for (const div of FOUNDATIONAL_DIVISIONS) {
+    const existing = db.prepare('SELECT id, status, runtime_mode FROM agents WHERE id = ?').get(div.id) as
+      | { id: string; status: string; runtime_mode: string }
+      | undefined;
+
+    if (!existing) {
+      db.prepare(`
+        INSERT INTO agents (
+          id, name, division, description, responsibilities,
+          model_provider, model_name, status, runtime_mode,
+          capabilities_json, config_json, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+      `).run(
         div.id,
         div.name,
         div.division,
         div.description,
         div.responsibilities,
-        'unassigned',
-        'none',
-        'standby',
-        'architecture_only',
-        JSON.stringify([]),
-        JSON.stringify({ autonomousExecutionReady: false, phaseTarget: 'Phase 2' }),
+        hasVerifiedAi ? 'auto_routed' : 'unassigned',
+        hasVerifiedAi ? 'intelligent_router' : 'none',
+        hasVerifiedAi ? 'active' : 'standby',
+        hasVerifiedAi ? 'ai_orchestrated' : 'architecture_only',
+        JSON.stringify(div.capabilities),
+        JSON.stringify({ phase2OrchestrationReady: true, autoRouted: true }),
         now,
         now
       );
+    } else if (existing.status !== 'disabled') {
+      // Update capabilities metadata & reflect real provider availability honestly
+      db.prepare(`
+        UPDATE agents
+        SET capabilities_json = ?,
+            runtime_mode = ?,
+            status = ?,
+            model_provider = CASE WHEN model_provider = 'unassigned' AND ? = 1 THEN 'auto_routed' ELSE model_provider END,
+            model_name = CASE WHEN model_name = 'none' AND ? = 1 THEN 'intelligent_router' ELSE model_name END,
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        JSON.stringify(div.capabilities),
+        hasVerifiedAi ? 'ai_orchestrated' : 'architecture_only',
+        hasVerifiedAi ? 'active' : 'standby',
+        hasVerifiedAi ? 1 : 0,
+        hasVerifiedAi ? 1 : 0,
+        now,
+        div.id
+      );
     }
   }
+}
+
+export function seedSystemFoundations(): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // Seed or sync core divisions without wiping custom agents
+  syncDivisionCapabilitiesAndStatus();
 
   // Seed integration registry records if missing. Never mark connected until tested!
   const insertIntegration = db.prepare(`
@@ -204,20 +303,43 @@ export function seedSystemFoundations(): void {
     );
   }
 
-  // Seed default system settings
+  // Seed default workspace policy (update phaseLabel cleanly for Phase 2)
+  const existingPolicy = db
+    .prepare("SELECT value_json FROM system_settings WHERE key = 'workspace_policy'")
+    .get() as { value_json: string } | undefined;
+
+  if (!existingPolicy) {
+    db.prepare(`
+      INSERT INTO system_settings (key, value_json, updated_at)
+      VALUES ('workspace_policy', ?, ?)
+    `).run(
+      JSON.stringify({
+        requireApprovalForExternalActions: true,
+        defaultIntakeMode: 'plan_and_execute',
+        platformPhase: 'Phase 2: Multi-Agent Orchestration',
+        executionEngineReady: true,
+      }),
+      now
+    );
+  } else {
+    try {
+      const parsed = JSON.parse(existingPolicy.value_json) as Record<string, unknown>;
+      parsed.platformPhase = 'Phase 2: Multi-Agent Orchestration';
+      parsed.executionEngineReady = true;
+      db.prepare("UPDATE system_settings SET value_json = ?, updated_at = ? WHERE key = 'workspace_policy'").run(
+        JSON.stringify(parsed),
+        now
+      );
+    } catch {
+      // Ignore malformed legacy policy
+    }
+  }
+
+  // Seed default intelligent model routing policy if missing
   db.prepare(`
     INSERT OR IGNORE INTO system_settings (key, value_json, updated_at)
-    VALUES (?, ?, ?)
-  `).run(
-    'workspace_policy',
-    JSON.stringify({
-      requireApprovalForExternalActions: true,
-      defaultIntakeMode: 'ai_assisted_when_connected',
-      platformPhase: 'Phase 1: System Foundation',
-      executionEngineReady: false,
-    }),
-    now
-  );
+    VALUES ('routing_policy', ?, ?)
+  `).run(JSON.stringify(DEFAULT_ROUTING_POLICY), now);
 
   // Clean expired sessions on boot
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);

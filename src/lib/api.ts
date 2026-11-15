@@ -1,11 +1,13 @@
 import type {
   AgentRecord,
+  AiExecutionAuditRecord,
   CommandRecord,
   CreationCategory,
   CreationContentType,
   CreationRecord,
   DivisionCode,
   ExecutionLogRecord,
+  ExecutionRunRecord,
   IntegrationProviderKey,
   IntegrationRecord,
   LibraryCategory,
@@ -13,11 +15,53 @@ import type {
   OverviewPayload,
   ProjectRecord,
   ProjectStatus,
+  RoutingPolicy,
   TaskRecord,
   UserProfile,
   UserRole,
   VentureRecord,
 } from '../../shared/types.ts';
+
+export interface GithubRepoSummary {
+  id: number;
+  name: string;
+  fullName: string;
+  private: boolean;
+  htmlUrl: string;
+  description: string | null;
+  defaultBranch: string;
+  updatedAt: string;
+}
+
+export interface EmailOutboxRecord {
+  id: string;
+  toEmail: string;
+  subject: string;
+  bodyText: string;
+  status: 'awaiting_approval' | 'sent' | 'rejected' | 'failed';
+  providerMessageId: string | null;
+  errorMessage: string | null;
+  projectId: string | null;
+  runId: string | null;
+  createdBy: string;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  sentAt: string | null;
+  createdAt: string;
+}
+
+export interface BrowserInspectionResult {
+  url: string;
+  finalUrl: string;
+  mode: 'remote_cdp_browser' | 'http_dom_fetch';
+  statusCode: number;
+  title: string;
+  metaDescription: string;
+  headings: string[];
+  linksCount: number;
+  textExcerpt: string;
+  fetchedAt: string;
+}
 
 const TOKEN_STORAGE_KEY = 'taurus_session_token';
 
@@ -119,14 +163,33 @@ export const api = {
       prompt: string;
       projectId?: string | null;
       assignedAgentId?: string | null;
+      autoExecute?: boolean;
       runAiIntake?: boolean;
     }) =>
-      apiFetch<{ command: CommandRecord }>('/api/commands', {
+      apiFetch<{ command: CommandRecord; executionRun: ExecutionRunRecord | null }>('/api/commands', {
         method: 'POST',
         body: JSON.stringify(body),
       }),
-    analyze: (id: string) =>
-      apiFetch<{ command: CommandRecord }>(`/api/commands/${id}/analyze`, { method: 'POST' }),
+    analyze: (id: string, autoExecute = true) =>
+      apiFetch<{ command: CommandRecord; executionRun: ExecutionRunRecord | null }>(`/api/commands/${id}/analyze`, {
+        method: 'POST',
+        body: JSON.stringify({ autoExecute }),
+      }),
+    clarify: (id: string, answer: string, autoExecute = true) =>
+      apiFetch<{ command: CommandRecord; executionRun: ExecutionRunRecord | null }>(`/api/commands/${id}/clarify`, {
+        method: 'POST',
+        body: JSON.stringify({ answer, autoExecute }),
+      }),
+    execute: (id: string) =>
+      apiFetch<{ command: CommandRecord; executionRun: ExecutionRunRecord | null }>(`/api/commands/${id}/execute`, {
+        method: 'POST',
+      }),
+    run: (id: string) => apiFetch<{ executionRun: ExecutionRunRecord | null }>(`/api/commands/${id}/run`),
+    decideStep: (stepId: string, decision: 'approve' | 'reject') =>
+      apiFetch<{ executionRun: ExecutionRunRecord | null }>(`/api/commands/steps/${stepId}/decision`, {
+        method: 'POST',
+        body: JSON.stringify({ decision }),
+      }),
     update: (
       id: string,
       body: {
@@ -195,6 +258,32 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(body),
       }),
+    executeTask: (
+      agentId: string,
+      body: {
+        title: string;
+        objective?: string;
+        projectId?: string | null;
+      }
+    ) =>
+      apiFetch<{
+        ok: boolean;
+        taskId: string;
+        runId: string;
+        result: {
+          outputSummary: string;
+          providerKey: string;
+          modelName: string;
+          routingReason: string;
+          tokensUsed: number;
+          latencyMs: number;
+          outputCreationId: string | null;
+          outputFileId: string | null;
+        };
+      }>(`/api/agents/${agentId}/execute-task`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
     delete: (id: string) => apiFetch<{ ok: boolean }>(`/api/agents/${id}`, { method: 'DELETE' }),
   },
 
@@ -224,6 +313,11 @@ export const api = {
 
   foundry: {
     list: () => apiFetch<{ ventures: VentureRecord[] }>('/api/foundry'),
+    createNatural: (body: { idea: string; projectId?: string | null }) =>
+      apiFetch<{ venture: VentureRecord; creationId: string; projectId: string }>('/api/foundry/natural', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
     create: (body: {
       name: string;
       targetMarket: string;
@@ -237,6 +331,14 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(body),
       }),
+    approve: (id: string, buildInitialPrototype: boolean) =>
+      apiFetch<{ venture: VentureRecord; prototypeCreationId: string | null; tasksCreated: number }>(
+        `/api/foundry/${id}/approve`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ buildInitialPrototype }),
+        }
+      ),
     synthesize: (id: string) =>
       apiFetch<{ venture: VentureRecord; creationId: string }>(`/api/foundry/${id}/synthesize`, {
         method: 'POST',
@@ -327,6 +429,53 @@ export const api = {
       apiFetch<{ integration: IntegrationRecord }>(`/api/integrations/${providerKey}/test`, {
         method: 'POST',
       }),
+    routing: {
+      get: () => apiFetch<{ policy: RoutingPolicy; recentExecutions: AiExecutionAuditRecord[] }>('/api/integrations/routing'),
+      update: (body: Partial<RoutingPolicy>) =>
+        apiFetch<{ policy: RoutingPolicy }>('/api/integrations/routing', {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
+    },
+    github: {
+      repos: () => apiFetch<{ repos: GithubRepoSummary[] }>('/api/integrations/github/repos'),
+      createRepo: (body: { name: string; description?: string; isPrivate?: boolean }) =>
+        apiFetch<{ repo: GithubRepoSummary }>('/api/integrations/github/repos', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+      commit: (body: {
+        repoFullName: string;
+        filePath: string;
+        content: string;
+        commitMessage?: string;
+        creationId?: string;
+      }) =>
+        apiFetch<{ htmlUrl: string; sha: string }>('/api/integrations/github/commit', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+    },
+    email: {
+      outbox: () => apiFetch<{ emails: EmailOutboxRecord[] }>('/api/integrations/email/outbox'),
+      queue: (body: { toEmail: string; subject: string; bodyText: string; projectId?: string | null }) =>
+        apiFetch<{ email: EmailOutboxRecord }>('/api/integrations/email/queue', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }),
+      decide: (id: string, decision: 'approve_and_send' | 'reject') =>
+        apiFetch<{ email: EmailOutboxRecord }>(`/api/integrations/email/${id}/decision`, {
+          method: 'POST',
+          body: JSON.stringify({ decision }),
+        }),
+    },
+    browser: {
+      inspect: (url: string) =>
+        apiFetch<{ inspection: BrowserInspectionResult }>('/api/integrations/browser/inspect', {
+          method: 'POST',
+          body: JSON.stringify({ url }),
+        }),
+    },
   },
 
   settings: {
@@ -339,6 +488,8 @@ export const api = {
           executionEngineReady?: boolean;
         };
         policyUpdatedAt: string | null;
+        routingPolicy: RoutingPolicy;
+        aiExecutions: AiExecutionAuditRecord[];
         infrastructure: {
           nodeVersion: string;
           databaseEngine: string;
@@ -346,6 +497,8 @@ export const api = {
           storageDirectory: string;
           storageFileCount: number;
           storageTotalBytes: number;
+          storageDurability?: string;
+          durabilityNotice?: string;
           encryptionAlgorithm: string;
         };
         logs: Array<{
@@ -363,6 +516,26 @@ export const api = {
         method: 'PATCH',
         body: JSON.stringify(body),
       }),
+    downloadBackup: async (): Promise<void> => {
+      const token = getStoredSessionToken();
+      const res = await fetch('/api/settings/backup', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new ApiError(data.error || `Backup download failed (${res.status})`, res.status);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `taurus-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    },
   },
 };
 

@@ -1,10 +1,11 @@
-import { GoogleGenAI } from '@google/genai';
-import type { ConnectionStatus, IntegrationProviderKey, IntegrationRecord } from '../../shared/types.ts';
+import { GoogleGenAI, type Schema } from '@google/genai';
+import type { AiProviderKey, ConnectionStatus, IntegrationProviderKey, IntegrationRecord } from '../../shared/types.ts';
 import { getDb } from '../db/database.ts';
+import { syncDivisionCapabilitiesAndStatus } from '../db/seed.ts';
 import { decryptSecret, encryptSecret } from './crypto.ts';
 import { logEvent } from './logger.ts';
 
-interface RawIntegrationRow {
+export interface RawIntegrationRow {
   id: string;
   provider_key: IntegrationProviderKey;
   display_name: string;
@@ -20,6 +21,48 @@ interface RawIntegrationRow {
   updated_at: string;
 }
 
+export interface UnifiedAiRequest {
+  providerKey: AiProviderKey;
+  model: string;
+  prompt: string;
+  systemInstruction?: string;
+  jsonMode?: boolean;
+  geminiSchema?: Schema;
+  timeoutMs?: number;
+  maxRetries?: number;
+}
+
+export interface UnifiedAiResponse {
+  text: string;
+  providerKey: AiProviderKey;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  attempts: number;
+}
+
+export class ProviderExecutionError extends Error {
+  providerKey: AiProviderKey;
+  model: string;
+  statusCode?: number;
+  retryable: boolean;
+  attempts: number;
+
+  constructor(
+    message: string,
+    opts: { providerKey: AiProviderKey; model: string; statusCode?: number; retryable?: boolean; attempts?: number }
+  ) {
+    super(message);
+    this.providerKey = opts.providerKey;
+    this.model = opts.model;
+    this.statusCode = opts.statusCode;
+    this.retryable = Boolean(opts.retryable);
+    this.attempts = opts.attempts ?? 1;
+  }
+}
+
 export function getGeminiServerClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) return null;
@@ -33,20 +76,45 @@ export function getGeminiServerClient(): GoogleGenAI | null {
   });
 }
 
-export function isGeminiVerifiedConnected(): boolean {
+export function getIntegrationRow(providerKey: IntegrationProviderKey): RawIntegrationRow | undefined {
   const db = getDb();
-  const row = db
-    .prepare('SELECT connection_status FROM integrations WHERE provider_key = ?')
-    .get('google_gemini') as { connection_status: string } | undefined;
-  return Boolean(process.env.GEMINI_API_KEY?.trim()) && row?.connection_status === 'connected';
+  return db.prepare('SELECT * FROM integrations WHERE provider_key = ?').get(providerKey) as
+    | RawIntegrationRow
+    | undefined;
+}
+
+export function getProviderSecret(row: RawIntegrationRow): string | null {
+  if (row.provider_key === 'google_gemini') {
+    return process.env.GEMINI_API_KEY?.trim() || null;
+  }
+  if (row.encrypted_credentials) {
+    return decryptSecret(row.encrypted_credentials);
+  }
+  if (row.provider_key === 'groq') return process.env.GROQ_API_KEY?.trim() || null;
+  if (row.provider_key === 'openai') return process.env.OPENAI_API_KEY?.trim() || null;
+  if (row.provider_key === 'github') return process.env.GITHUB_TOKEN?.trim() || null;
+  if (row.provider_key === 'email_services') return process.env.RESEND_API_KEY?.trim() || null;
+  return null;
+}
+
+export function parseIntegrationConfig(row: RawIntegrationRow): Record<string, string> {
+  try {
+    return JSON.parse(row.config_json || '{}') as Record<string, string>;
+  } catch {
+    return {};
+  }
 }
 
 export function toSanitizedIntegration(row: RawIntegrationRow): IntegrationRecord {
-  let config: Record<string, string> = {};
-  try {
-    config = JSON.parse(row.config_json || '{}') as Record<string, string>;
-  } catch {
-    config = {};
+  const config = parseIntegrationConfig(row);
+
+  let discoveredModels: string[] | undefined;
+  if (config.discoveredModels) {
+    try {
+      discoveredModels = JSON.parse(config.discoveredModels) as string[];
+    } catch {
+      discoveredModels = undefined;
+    }
   }
 
   let hasCredential = false;
@@ -72,6 +140,12 @@ export function toSanitizedIntegration(row: RawIntegrationRow): IntegrationRecor
     credentialSource = 'environment';
   }
 
+  // Expose safe config keys (omit serialized discoveredModels string in favor of typed array)
+  const safeConfig: Record<string, string> = {};
+  for (const [k, v] of Object.entries(config)) {
+    if (k !== 'discoveredModels') safeConfig[k] = v;
+  }
+
   return {
     id: row.id,
     providerKey: row.provider_key,
@@ -81,7 +155,8 @@ export function toSanitizedIntegration(row: RawIntegrationRow): IntegrationRecor
     connectionStatus: row.connection_status,
     hasCredential,
     credentialSource,
-    config,
+    config: safeConfig,
+    discoveredModels,
     accountLabel: row.account_label,
     lastTestedAt: row.last_tested_at,
     lastLatencyMs: row.last_latency_ms,
@@ -96,6 +171,11 @@ export function listIntegrations(): IntegrationRecord[] {
   return rows.map(toSanitizedIntegration);
 }
 
+export function isGeminiVerifiedConnected(): boolean {
+  const row = getIntegrationRow('google_gemini');
+  return Boolean(process.env.GEMINI_API_KEY?.trim()) && row?.connection_status === 'connected';
+}
+
 export function saveIntegrationCredentials(
   providerKey: IntegrationProviderKey,
   credential: string | null,
@@ -108,26 +188,16 @@ export function saveIntegrationCredentials(
   }
 
   const db = getDb();
-  const existing = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as RawIntegrationRow | undefined;
-
+  const existing = getIntegrationRow(providerKey);
   if (!existing) {
     throw new Error(`Unknown integration provider: ${providerKey}`);
   }
 
-  let currentConfig: Record<string, string> = {};
-  try {
-    currentConfig = JSON.parse(existing.config_json || '{}') as Record<string, string>;
-  } catch {
-    currentConfig = {};
-  }
-
+  const currentConfig = parseIntegrationConfig(existing);
   const mergedConfig = { ...currentConfig, ...configUpdates };
   const encrypted = credential && credential.trim() ? encryptSecret(credential.trim()) : existing.encrypted_credentials;
   const now = new Date().toISOString();
 
-  // Saving new credentials resets connection status to configured_untested until actually tested!
   const nextStatus: ConnectionStatus =
     encrypted || mergedConfig.endpointUrl || mergedConfig.healthUrl
       ? 'configured_untested'
@@ -143,21 +213,20 @@ export function saveIntegrationCredentials(
     WHERE provider_key = ?
   `).run(encrypted, JSON.stringify(mergedConfig), nextStatus, now, providerKey);
 
+  syncDivisionCapabilitiesAndStatus();
+
   logEvent({
     level: 'info',
     subsystem: 'NEXUS',
     action: 'integration.configured',
-    message: `Updated encrypted configuration for ${existing.display_name}. Connection requires live test verification.`,
+    message: `Updated encrypted configuration for ${existing.display_name}. Connection remains untested until verified.`,
     entityType: 'integration',
     entityId: existing.id,
     actorId,
     actorName,
   });
 
-  const updated = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as unknown as RawIntegrationRow;
-  return toSanitizedIntegration(updated);
+  return toSanitizedIntegration(getIntegrationRow(providerKey)!);
 }
 
 export function clearIntegrationCredentials(
@@ -170,19 +239,13 @@ export function clearIntegrationCredentials(
   }
 
   const db = getDb();
-  const existing = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as RawIntegrationRow | undefined;
+  const existing = getIntegrationRow(providerKey);
   if (!existing) throw new Error(`Unknown integration provider: ${providerKey}`);
 
-  let currentConfig: Record<string, string> = {};
-  try {
-    currentConfig = JSON.parse(existing.config_json || '{}') as Record<string, string>;
-  } catch {
-    currentConfig = {};
-  }
+  const currentConfig = parseIntegrationConfig(existing);
   if ('endpointUrl' in currentConfig) currentConfig.endpointUrl = '';
   if ('healthUrl' in currentConfig) currentConfig.healthUrl = '';
+  delete currentConfig.discoveredModels;
 
   const now = new Date().toISOString();
   db.prepare(`
@@ -198,6 +261,8 @@ export function clearIntegrationCredentials(
     WHERE provider_key = ?
   `).run(JSON.stringify(currentConfig), now, providerKey);
 
+  syncDivisionCapabilitiesAndStatus();
+
   logEvent({
     level: 'warn',
     subsystem: 'NEXUS',
@@ -209,21 +274,210 @@ export function clearIntegrationCredentials(
     actorName,
   });
 
-  const updated = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as unknown as RawIntegrationRow;
-  return toSanitizedIntegration(updated);
+  return toSanitizedIntegration(getIntegrationRow(providerKey)!);
 }
 
-function getProviderSecret(row: RawIntegrationRow): string | null {
-  if (row.encrypted_credentials) {
-    return decryptSecret(row.encrypted_credentials);
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status?: number): boolean {
+  if (!status) return true;
+  return status === 429 || status === 408 || status >= 500;
+}
+
+async function executeOpenAiCompatibleCompletion(
+  providerKey: 'groq' | 'openai',
+  baseUrl: string,
+  token: string,
+  req: UnifiedAiRequest
+): Promise<Omit<UnifiedAiResponse, 'latencyMs' | 'attempts'>> {
+  const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
+  if (req.systemInstruction) {
+    messages.push({ role: 'system', content: req.systemInstruction });
   }
-  if (row.provider_key === 'groq') return process.env.GROQ_API_KEY?.trim() || null;
-  if (row.provider_key === 'openai') return process.env.OPENAI_API_KEY?.trim() || null;
-  if (row.provider_key === 'github') return process.env.GITHUB_TOKEN?.trim() || null;
-  if (row.provider_key === 'email_services') return process.env.RESEND_API_KEY?.trim() || null;
-  return null;
+  messages.push({ role: 'user', content: req.prompt });
+
+  const bodyPayload: Record<string, unknown> = {
+    model: req.model,
+    messages,
+  };
+  if (req.jsonMode) {
+    bodyPayload.response_format = { type: 'json_object' };
+  }
+
+  const res = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(bodyPayload),
+    signal: AbortSignal.timeout(req.timeoutMs ?? 45000),
+  });
+
+  if (!res.ok) {
+    let errDetail = `HTTP ${res.status}`;
+    try {
+      const errBody = (await res.json()) as { error?: { message?: string } };
+      if (errBody.error?.message) errDetail = `${errDetail}: ${errBody.error.message}`;
+    } catch {
+      // fallback to status
+    }
+    throw new ProviderExecutionError(`${providerKey} request failed (${errDetail})`, {
+      providerKey,
+      model: req.model,
+      statusCode: res.status,
+      retryable: isRetryableStatus(res.status),
+    });
+  }
+
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    model?: string;
+  };
+
+  const text = (data.choices?.[0]?.message?.content ?? '').trim();
+  if (!text) {
+    throw new ProviderExecutionError(`${providerKey} returned an empty completion.`, {
+      providerKey,
+      model: req.model,
+      retryable: false,
+    });
+  }
+
+  return {
+    text,
+    providerKey,
+    model: data.model || req.model,
+    promptTokens: data.usage?.prompt_tokens ?? 0,
+    completionTokens: data.usage?.completion_tokens ?? 0,
+    totalTokens: data.usage?.total_tokens ?? 0,
+  };
+}
+
+async function executeGeminiCompletion(
+  req: UnifiedAiRequest
+): Promise<Omit<UnifiedAiResponse, 'latencyMs' | 'attempts'>> {
+  const client = getGeminiServerClient();
+  if (!client) {
+    throw new ProviderExecutionError('GEMINI_API_KEY is not configured on the server.', {
+      providerKey: 'google_gemini',
+      model: req.model,
+      statusCode: 401,
+      retryable: false,
+    });
+  }
+
+  try {
+    const config: Record<string, unknown> = {};
+    if (req.systemInstruction) config.systemInstruction = req.systemInstruction;
+    if (req.jsonMode) config.responseMimeType = 'application/json';
+    if (req.geminiSchema) config.responseSchema = req.geminiSchema;
+
+    const response = await client.models.generateContent({
+      model: req.model,
+      contents: req.prompt,
+      config: Object.keys(config).length > 0 ? config : undefined,
+    });
+
+    const text = (response.text ?? '').trim();
+    if (!text) {
+      throw new ProviderExecutionError('Gemini returned an empty response.', {
+        providerKey: 'google_gemini',
+        model: req.model,
+        retryable: false,
+      });
+    }
+
+    const usage = response.usageMetadata;
+    return {
+      text,
+      providerKey: 'google_gemini',
+      model: req.model,
+      promptTokens: usage?.promptTokenCount ?? 0,
+      completionTokens: usage?.candidatesTokenCount ?? 0,
+      totalTokens: usage?.totalTokenCount ?? 0,
+    };
+  } catch (err) {
+    if (err instanceof ProviderExecutionError) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    const statusMatch = msg.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
+    const statusCode = statusMatch ? Number(statusMatch[1]) : undefined;
+    throw new ProviderExecutionError(`Gemini request failed: ${msg}`, {
+      providerKey: 'google_gemini',
+      model: req.model,
+      statusCode,
+      retryable: isRetryableStatus(statusCode),
+    });
+  }
+}
+
+export async function executeProviderRequest(req: UnifiedAiRequest): Promise<UnifiedAiResponse> {
+  const row = getIntegrationRow(req.providerKey);
+  if (!row) {
+    throw new ProviderExecutionError(`Unknown provider ${req.providerKey}`, {
+      providerKey: req.providerKey,
+      model: req.model,
+      retryable: false,
+    });
+  }
+
+  const maxRetries = req.maxRetries ?? 2;
+  const startedAt = Date.now();
+  let lastError: ProviderExecutionError | null = null;
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      let result: Omit<UnifiedAiResponse, 'latencyMs' | 'attempts'>;
+
+      if (req.providerKey === 'google_gemini') {
+        result = await executeGeminiCompletion(req);
+      } else {
+        const token = getProviderSecret(row);
+        if (!token) {
+          throw new ProviderExecutionError(`No API key configured for ${row.display_name}.`, {
+            providerKey: req.providerKey,
+            model: req.model,
+            statusCode: 401,
+            retryable: false,
+          });
+        }
+        const config = parseIntegrationConfig(row);
+        const baseUrl =
+          config.baseUrl ||
+          (req.providerKey === 'groq' ? 'https://api.groq.com/openai/v1' : 'https://api.openai.com/v1');
+        result = await executeOpenAiCompatibleCompletion(req.providerKey, baseUrl, token, req);
+      }
+
+      return {
+        ...result,
+        latencyMs: Date.now() - startedAt,
+        attempts: attempt,
+      };
+    } catch (err) {
+      const pErr =
+        err instanceof ProviderExecutionError
+          ? err
+          : new ProviderExecutionError(err instanceof Error ? err.message : String(err), {
+              providerKey: req.providerKey,
+              model: req.model,
+              retryable: false,
+            });
+      pErr.attempts = attempt;
+      lastError = pErr;
+
+      if (!pErr.retryable || attempt > maxRetries) {
+        throw pErr;
+      }
+
+      // Exponential backoff for transient rate limits / 5xx
+      await sleep(500 * Math.pow(2, attempt - 1));
+    }
+  }
+
+  throw lastError!;
 }
 
 export async function testIntegrationConnection(
@@ -232,21 +486,12 @@ export async function testIntegrationConnection(
   actorName: string
 ): Promise<IntegrationRecord> {
   const db = getDb();
-  const row = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as RawIntegrationRow | undefined;
-
+  const row = getIntegrationRow(providerKey);
   if (!row) {
     throw new Error(`Unknown integration provider: ${providerKey}`);
   }
 
-  let config: Record<string, string> = {};
-  try {
-    config = JSON.parse(row.config_json || '{}') as Record<string, string>;
-  } catch {
-    config = {};
-  }
-
+  const config = parseIntegrationConfig(row);
   const startedAt = Date.now();
   const testedAt = new Date().toISOString();
 
@@ -261,47 +506,128 @@ export async function testIntegrationConnection(
         nextStatus = 'not_configured';
         throw new Error('GEMINI_API_KEY environment variable is not set.');
       }
-      const response = await client.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: 'Respond with exactly: OK',
-      });
-      if (!response.text) {
-        throw new Error('Gemini returned an empty response during verification.');
+
+      // 1. Discover official models from Gemini API
+      const discovered: string[] = [];
+      try {
+        const pager = await client.models.list({ config: { pageSize: 50 } });
+        for await (const m of pager) {
+          if (m.name) {
+            discovered.push(m.name.replace(/^models\//, ''));
+          }
+        }
+      } catch {
+        // If list endpoint is restricted on key tier, continue with direct generateContent probe
       }
+
+      // 2. Verify actual completion execution on default model (and fallback to gemini-3.1-flash-lite if needed)
+      let verifiedModel = config.defaultModel || 'gemini-4-hydrogen';
+      try {
+        await executeProviderRequest({
+          providerKey: 'google_gemini',
+          model: verifiedModel,
+          prompt: 'Respond with exactly: OK',
+          maxRetries: 0,
+          timeoutMs: 20000,
+        });
+      } catch (primaryErr) {
+        if (verifiedModel !== 'gemini-3.1-flash-lite') {
+          await executeProviderRequest({
+            providerKey: 'google_gemini',
+            model: 'gemini-3.1-flash-lite',
+            prompt: 'Respond with exactly: OK',
+            maxRetries: 0,
+            timeoutMs: 20000,
+          });
+          verifiedModel = 'gemini-3.1-flash-lite';
+        } else {
+          throw primaryErr;
+        }
+      }
+
+      if (discovered.length > 0) {
+        config.discoveredModels = JSON.stringify(discovered.slice(0, 30));
+      } else {
+        config.discoveredModels = JSON.stringify([verifiedModel]);
+      }
+      config.defaultModel = verifiedModel;
+
       nextStatus = 'connected';
-      accountLabel = 'Model verified: gemini-4-hydrogen';
+      accountLabel = `Verified completion on ${verifiedModel}${discovered.length > 0 ? ` (${discovered.length} models listed)` : ''}`;
     } else if (providerKey === 'groq') {
       const token = getProviderSecret(row);
       if (!token) {
         nextStatus = 'not_configured';
         throw new Error('No Groq API key configured in encrypted vault or environment.');
       }
-      const res = await fetch('https://api.groq.com/openai/v1/models', {
+      const groqBaseUrl = (config.baseUrl || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
+      const modelsRes = await fetch(`${groqBaseUrl}/models`, {
         headers: { Authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
-      if (!res.ok) {
-        throw new Error(`Groq authentication failed with HTTP ${res.status}.`);
+      if (!modelsRes.ok) {
+        throw new Error(`Groq authentication failed with HTTP ${modelsRes.status}.`);
       }
-      const data = (await res.json()) as { data?: Array<{ id: string }> };
+      const modelsData = (await modelsRes.json()) as { data?: Array<{ id: string }> };
+      const modelIds = (modelsData.data || []).map((m) => m.id);
+      const testModel =
+        modelIds.find((id) => id === (config.defaultModel || 'llama-3.3-70b-versatile')) ||
+        modelIds.find((id) => id.includes('llama')) ||
+        modelIds[0];
+
+      if (!testModel) {
+        throw new Error('No executable Groq models returned for this API key.');
+      }
+
+      // Prove real completion execution works, not just key lookup
+      await executeProviderRequest({
+        providerKey: 'groq',
+        model: testModel,
+        prompt: 'Respond with exactly: OK',
+        maxRetries: 0,
+        timeoutMs: 20000,
+      });
+
+      config.discoveredModels = JSON.stringify(modelIds.slice(0, 30));
+      config.defaultModel = testModel;
       nextStatus = 'connected';
-      accountLabel = `${data.data?.length ?? 0} Groq models accessible`;
+      accountLabel = `Verified completion on ${testModel} (${modelIds.length} models)`;
     } else if (providerKey === 'openai') {
       const token = getProviderSecret(row);
       if (!token) {
         nextStatus = 'not_configured';
         throw new Error('No OpenAI API key configured in encrypted vault or environment.');
       }
-      const res = await fetch('https://api.openai.com/v1/models', {
+      const openaiBaseUrl = (config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+      const modelsRes = await fetch(`${openaiBaseUrl}/models`, {
         headers: { Authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
-      if (!res.ok) {
-        throw new Error(`OpenAI authentication failed with HTTP ${res.status}.`);
+      if (!modelsRes.ok) {
+        throw new Error(`OpenAI authentication failed with HTTP ${modelsRes.status}.`);
       }
-      const data = (await res.json()) as { data?: Array<{ id: string }> };
+      const modelsData = (await modelsRes.json()) as { data?: Array<{ id: string }> };
+      const modelIds = (modelsData.data || []).map((m) => m.id);
+      const testModel =
+        modelIds.find((id) => id === (config.defaultModel || 'gpt-4o-mini')) ||
+        modelIds.find((id) => id.startsWith('gpt-4o')) ||
+        modelIds[0] ||
+        'gpt-4o-mini';
+
+      await executeProviderRequest({
+        providerKey: 'openai',
+        model: testModel,
+        prompt: 'Respond with exactly: OK',
+        maxRetries: 0,
+        timeoutMs: 20000,
+      });
+
+      config.discoveredModels = JSON.stringify(
+        modelIds.filter((id) => id.startsWith('gpt-') || id.startsWith('o1') || id.startsWith('o3') || id.startsWith('o4')).slice(0, 30)
+      );
+      config.defaultModel = testModel;
       nextStatus = 'connected';
-      accountLabel = `${data.data?.length ?? 0} OpenAI models accessible`;
+      accountLabel = `Verified completion on ${testModel} (${modelIds.length} total models)`;
     } else if (providerKey === 'github') {
       const token = getProviderSecret(row);
       if (!token) {
@@ -314,12 +640,12 @@ export async function testIntegrationConnection(
           'User-Agent': 'Taurus-Operations-Platform',
           Accept: 'application/vnd.github+json',
         },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) {
         throw new Error(`GitHub authentication failed with HTTP ${res.status}.`);
       }
-      const user = (await res.json()) as { login?: string };
+      const user = (await res.json()) as { login?: string; public_repos?: number };
       nextStatus = 'connected';
       accountLabel = user.login ? `@${user.login}` : 'Authenticated GitHub account';
     } else if (providerKey === 'email_services') {
@@ -330,7 +656,7 @@ export async function testIntegrationConnection(
       }
       const res = await fetch('https://api.resend.com/domains', {
         headers: { Authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) {
         throw new Error(`Email service authentication failed with HTTP ${res.status}.`);
@@ -342,16 +668,18 @@ export async function testIntegrationConnection(
       const endpoint = config.endpointUrl?.trim();
       if (!endpoint) {
         nextStatus = 'not_configured';
-        throw new Error('No remote Chromium CDP or WebDriver endpoint configured in this environment.');
+        throw new Error(
+          'No remote Chromium CDP / WebDriver endpoint configured. Public URL HTML inspection still works via HTTP Fetch Adapter.'
+        );
       }
       const probeUrl = endpoint.endsWith('/json/version') ? endpoint : `${endpoint.replace(/\/$/, '')}/json/version`;
-      const res = await fetch(probeUrl, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(probeUrl, { signal: AbortSignal.timeout(6000) });
       if (!res.ok) {
         throw new Error(`Browser automation endpoint responded with HTTP ${res.status}.`);
       }
       const info = (await res.json()) as { Browser?: string };
       nextStatus = 'connected';
-      accountLabel = info.Browser || 'Remote browser endpoint verified';
+      accountLabel = info.Browser || 'Remote browser CDP endpoint verified';
     } else if (providerKey === 'external_apis') {
       const healthUrl = config.healthUrl?.trim();
       if (!healthUrl) {
@@ -361,7 +689,7 @@ export async function testIntegrationConnection(
       const token = getProviderSecret(row);
       const headers: Record<string, string> = {};
       if (token) headers.Authorization = `Bearer ${token}`;
-      const res = await fetch(healthUrl, { headers, signal: AbortSignal.timeout(8000) });
+      const res = await fetch(healthUrl, { headers, signal: AbortSignal.timeout(10000) });
       if (!res.ok) {
         throw new Error(`External API endpoint returned HTTP ${res.status}.`);
       }
@@ -380,13 +708,16 @@ export async function testIntegrationConnection(
   db.prepare(`
     UPDATE integrations
     SET connection_status = ?,
+        config_json = ?,
         account_label = ?,
         last_tested_at = ?,
         last_latency_ms = ?,
         last_error = ?,
         updated_at = ?
     WHERE provider_key = ?
-  `).run(nextStatus, accountLabel, testedAt, latencyMs, errorMessage, testedAt, providerKey);
+  `).run(nextStatus, JSON.stringify(config), accountLabel, testedAt, latencyMs, errorMessage, testedAt, providerKey);
+
+  syncDivisionCapabilitiesAndStatus();
 
   logEvent({
     level: nextStatus === 'connected' ? 'success' : 'error',
@@ -394,7 +725,7 @@ export async function testIntegrationConnection(
     action: 'integration.tested',
     message:
       nextStatus === 'connected'
-        ? `Verified live connection to ${row.display_name} (${latencyMs}ms)${accountLabel ? ` · ${accountLabel}` : ''}.`
+        ? `Verified live execution & authentication for ${row.display_name} (${latencyMs}ms)${accountLabel ? ` · ${accountLabel}` : ''}.`
         : `Connection verification failed for ${row.display_name}: ${errorMessage}`,
     entityType: 'integration',
     entityId: row.id,
@@ -402,8 +733,5 @@ export async function testIntegrationConnection(
     actorName,
   });
 
-  const updated = db
-    .prepare('SELECT * FROM integrations WHERE provider_key = ?')
-    .get(providerKey) as unknown as RawIntegrationRow;
-  return toSanitizedIntegration(updated);
+  return toSanitizedIntegration(getIntegrationRow(providerKey)!);
 }

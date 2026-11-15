@@ -1,13 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Download, Eye, Plus, Trash2, X } from 'lucide-react';
+import { Download, Eye, GitBranch, Maximize2, Minimize2, Plus, Save, Trash2, X } from 'lucide-react';
 import type {
   CreationCategory,
   CreationContentType,
   CreationRecord,
+  IntegrationRecord,
   ProjectRecord,
   UserRole,
 } from '../../shared/types.ts';
-import { api, ApiError, formatTimestamp, getStoredSessionToken } from '../lib/api.ts';
+import { api, ApiError, formatTimestamp, getStoredSessionToken, type GithubRepoSummary } from '../lib/api.ts';
 
 const CATEGORIES: Array<{ id: CreationCategory | 'all'; label: string }> = [
   { id: 'all', label: 'All' },
@@ -27,9 +28,11 @@ interface CreationsViewProps {
 export function CreationsView({ userRole }: CreationsViewProps) {
   const [creations, setCreations] = useState<CreationRecord[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [githubConnected, setGithubConnected] = useState(false);
   const [category, setCategory] = useState<CreationCategory | 'all'>('all');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const [showCreate, setShowCreate] = useState(false);
   const [title, setTitle] = useState('');
@@ -41,15 +44,32 @@ export function CreationsView({ userRole }: CreationsViewProps) {
   const [saving, setSaving] = useState(false);
 
   const [previewItem, setPreviewItem] = useState<CreationRecord | null>(null);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
+
+  // GitHub publish modal
+  const [publishItem, setPublishItem] = useState<CreationRecord | null>(null);
+  const [repos, setRepos] = useState<GithubRepoSummary[]>([]);
+  const [loadingRepos, setLoadingRepos] = useState(false);
+  const [selectedRepo, setSelectedRepo] = useState('');
+  const [filePath, setFilePath] = useState('index.html');
+  const [commitMessage, setCommitMessage] = useState('');
+  const [publishing, setPublishing] = useState(false);
 
   const canMutate = userRole === 'owner' || userRole === 'operator';
+  const isOwner = userRole === 'owner';
 
   async function loadAll(cat: CreationCategory | 'all' = category) {
     setError(null);
     try {
-      const [cRes, pRes] = await Promise.all([api.creations.list(cat), api.projects.list()]);
+      const [cRes, pRes, iRes] = await Promise.all([
+        api.creations.list(cat),
+        api.projects.list(),
+        api.integrations.list(),
+      ]);
       setCreations(cRes.creations);
       setProjects(pRes.projects.filter((p) => p.status !== 'archived'));
+      const gh = iRes.integrations.find((i: IntegrationRecord) => i.providerKey === 'github');
+      setGithubConnected(gh?.connectionStatus === 'connected');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to load creations.');
     } finally {
@@ -84,6 +104,80 @@ export function CreationsView({ userRole }: CreationsViewProps) {
       setError(err instanceof ApiError ? err.message : 'Failed to save creation.');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSaveToLibrary(item: CreationRecord) {
+    setError(null);
+    setNotice(null);
+    const ext =
+      item.contentType === 'html'
+        ? 'html'
+        : item.contentType === 'markdown'
+          ? 'md'
+          : item.contentType === 'json'
+            ? 'json'
+            : 'txt';
+    const slug = item.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 48) || 'creation';
+    try {
+      await api.library.createText({
+        filename: `${slug}.${ext}`,
+        content: item.contentBody,
+        category: item.contentType === 'html' ? 'source_code' : 'generated_materials',
+        projectId: item.projectId,
+        description: item.description || `Saved from My Creations (${item.title})`,
+      });
+      setNotice(`Saved "${slug}.${ext}" to Library storage.`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Failed to save creation to Library.');
+    }
+  }
+
+  async function openPublishModal(item: CreationRecord) {
+    setPublishItem(item);
+    const ext = item.contentType === 'html' ? 'html' : item.contentType === 'markdown' ? 'md' : 'txt';
+    const slug = item.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40) || 'asset';
+    setFilePath(item.contentType === 'html' ? 'index.html' : `${slug}.${ext}`);
+    setCommitMessage(`Publish ${item.title} from TAURUS`);
+    setLoadingRepos(true);
+    setError(null);
+    try {
+      const res = await api.integrations.github.repos();
+      setRepos(res.repos);
+      if (res.repos.length > 0) setSelectedRepo(res.repos[0].fullName);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Unable to fetch GitHub repositories.');
+    } finally {
+      setLoadingRepos(false);
+    }
+  }
+
+  async function handlePublishGithub(e: FormEvent) {
+    e.preventDefault();
+    if (!publishItem || !selectedRepo || !filePath.trim()) return;
+    setPublishing(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.integrations.github.commit({
+        repoFullName: selectedRepo,
+        filePath: filePath.trim(),
+        content: publishItem.contentBody,
+        commitMessage: commitMessage.trim(),
+        creationId: publishItem.id,
+      });
+      setCreations((prev) =>
+        prev.map((c) => (c.id === publishItem.id ? { ...c, deployedUrl: res.htmlUrl } : c))
+      );
+      if (previewItem?.id === publishItem.id) {
+        setPreviewItem({ ...previewItem, deployedUrl: res.htmlUrl });
+      }
+      setPublishItem(null);
+      setNotice(`Committed creation to GitHub: ${res.htmlUrl}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'GitHub commit failed.');
+    } finally {
+      setPublishing(false);
     }
   }
 
@@ -135,7 +229,7 @@ export function CreationsView({ userRole }: CreationsViewProps) {
         <div>
           <h2 className="font-display text-xl font-semibold text-white">My Creations</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Deliverables produced by TAURUS with live preview rendering and direct asset downloads.
+            Interactive applications, websites, blueprints, and operational deliverables with sandboxed preview, Library archiving, and GitHub publishing.
           </p>
         </div>
 
@@ -157,13 +251,19 @@ export function CreationsView({ userRole }: CreationsViewProps) {
         </div>
       )}
 
+      {notice && (
+        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300 break-all">
+          {notice}
+        </div>
+      )}
+
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
         {CATEGORIES.map((cat) => (
           <button
             key={cat.id}
             type="button"
             onClick={() => setCategory(cat.id)}
-            className={`min-h-[36px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
+            className={`min-h-[38px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
               category === cat.id ? 'bg-white text-slate-900' : 'bg-[#11161F] text-slate-400 hover:text-white'
             }`}
           >
@@ -178,7 +278,7 @@ export function CreationsView({ userRole }: CreationsViewProps) {
         <div className="rounded-2xl bg-[#11161F] border border-white/[0.08] p-8 text-center">
           <p className="text-sm text-slate-300">No creations stored in this category yet.</p>
           <p className="text-xs text-slate-500 mt-1">
-            Synthesize a venture in Business Foundry or register an HTML, Markdown, or JSON deliverable here.
+            Execute a directive in Command Center, build a venture prototype in Business Foundry, or register an asset here.
           </p>
         </div>
       ) : (
@@ -191,34 +291,77 @@ export function CreationsView({ userRole }: CreationsViewProps) {
               <div>
                 <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
                   <span className="capitalize">{item.category}</span>
-                  <span className="font-mono uppercase">{item.contentType}</span>
+                  <span className="font-mono uppercase">
+                    {item.contentType}
+                    {item.isInteractive ? ' · Interactive' : ''}
+                  </span>
                 </div>
                 <h3 className="mt-2 font-display text-base font-semibold text-white">{item.title}</h3>
                 {item.description && <p className="mt-1 text-xs text-slate-400 line-clamp-2">{item.description}</p>}
+
                 <div className="mt-2 text-xs text-slate-500 tabular-nums">
                   {item.projectName ? `${item.projectName} · ` : ''}
                   {formatTimestamp(item.updatedAt)}
                 </div>
+
+                {item.deployedUrl ? (
+                  <a
+                    href={item.deployedUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-2 block text-xs text-emerald-400 hover:text-emerald-300 underline truncate"
+                  >
+                    Published URL: {item.deployedUrl}
+                  </a>
+                ) : (
+                  <div className="mt-2 text-[11px] text-slate-500">
+                    Local Interactive Preview (not externally deployed)
+                  </div>
+                )}
               </div>
 
-              <div className="pt-3 border-t border-white/[0.06] flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
+              <div className="pt-3 border-t border-white/[0.06] flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setPreviewItem(item)}
-                    className="min-h-[36px] px-3 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
+                    onClick={() => {
+                      setPreviewFullscreen(false);
+                      setPreviewItem(item);
+                    }}
+                    className="min-h-[38px] px-3 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <Eye className="w-3.5 h-3.5" />
-                    <span>Preview</span>
+                    <span>{item.contentType === 'html' ? 'Run Preview' : 'Inspect'}</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => handleDownload(item)}
-                    className="min-h-[36px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                    className="min-h-[38px] px-2.5 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" />
                     <span>Download</span>
                   </button>
+                  {canMutate && (
+                    <button
+                      type="button"
+                      onClick={() => handleSaveToLibrary(item)}
+                      title="Save copy to Library"
+                      className="min-h-[38px] px-2.5 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Library</span>
+                    </button>
+                  )}
+                  {isOwner && githubConnected && (
+                    <button
+                      type="button"
+                      onClick={() => openPublishModal(item)}
+                      className="min-h-[38px] px-2.5 rounded-lg border border-blue-500/30 hover:bg-blue-500/10 text-xs text-blue-300 inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <GitBranch className="w-3.5 h-3.5" />
+                      <span>GitHub</span>
+                    </button>
+                  )}
                 </div>
 
                 {canMutate && (
@@ -226,7 +369,7 @@ export function CreationsView({ userRole }: CreationsViewProps) {
                     type="button"
                     aria-label={`Delete ${item.title}`}
                     onClick={() => handleDelete(item.id)}
-                    className="min-h-[36px] min-w-[36px] rounded-lg flex items-center justify-center text-slate-500 hover:text-rose-400 cursor-pointer"
+                    className="min-h-[38px] min-w-[38px] rounded-lg flex items-center justify-center text-slate-500 hover:text-rose-400 cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
@@ -287,7 +430,7 @@ export function CreationsView({ userRole }: CreationsViewProps) {
                     onChange={(e) => setContentType(e.target.value as CreationContentType)}
                     className="w-full h-11 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-sm text-white"
                   >
-                    <option value="html">HTML (Live Preview)</option>
+                    <option value="html">HTML (Interactive Preview)</option>
                     <option value="markdown">Markdown</option>
                     <option value="json">JSON</option>
                     <option value="text">Plain Text</option>
@@ -354,22 +497,37 @@ export function CreationsView({ userRole }: CreationsViewProps) {
         </div>
       )}
 
-      {/* Live Preview Modal */}
+      {/* Interactive Preview Workspace Modal */}
       {previewItem && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-4xl rounded-2xl bg-[#11161F] border border-white/[0.1] overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="px-5 py-4 border-b border-white/[0.08] flex items-center justify-between gap-4">
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4">
+          <div
+            className={`rounded-2xl bg-[#11161F] border border-white/[0.1] overflow-hidden flex flex-col ${
+              previewFullscreen ? 'w-full h-full' : 'w-full max-w-5xl max-h-[92vh]'
+            }`}
+          >
+            <div className="px-4 sm:px-5 py-3.5 border-b border-white/[0.08] flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
                 <h3 className="font-display text-base font-semibold text-white truncate">{previewItem.title}</h3>
                 <p className="text-xs text-slate-400 capitalize">
-                  {previewItem.category} · {previewItem.contentType}
+                  {previewItem.category} · {previewItem.contentType} ·{' '}
+                  {previewItem.deployedUrl ? 'Externally Published' : 'Local Sandboxed Preview'}
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0">
+                {previewItem.contentType === 'html' && (
+                  <button
+                    type="button"
+                    onClick={() => setPreviewFullscreen((v) => !v)}
+                    className="min-h-[38px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {previewFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                    <span className="hidden sm:inline">{previewFullscreen ? 'Restore' : 'Expand'}</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => handleDownload(previewItem)}
-                  className="min-h-[36px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
+                  className="min-h-[38px] px-3 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
                   <span>Download</span>
@@ -377,20 +535,22 @@ export function CreationsView({ userRole }: CreationsViewProps) {
                 <button
                   type="button"
                   onClick={() => setPreviewItem(null)}
-                  className="min-h-[36px] min-w-[36px] rounded-lg flex items-center justify-center text-slate-400 hover:text-white cursor-pointer"
+                  className="min-h-[38px] min-w-[38px] rounded-lg flex items-center justify-center text-slate-400 hover:text-white cursor-pointer"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-5 bg-[#0A0D12]">
+            <div className="flex-1 overflow-auto p-3 sm:p-5 bg-[#0A0D12]">
               {previewItem.contentType === 'html' ? (
                 <iframe
                   title={previewItem.title}
-                  sandbox=""
+                  sandbox="allow-scripts"
                   srcDoc={previewItem.contentBody}
-                  className="w-full h-[65vh] rounded-xl bg-white border border-white/[0.1]"
+                  className={`w-full rounded-xl bg-white border border-white/[0.1] ${
+                    previewFullscreen ? 'h-full min-h-[75vh]' : 'h-[68vh]'
+                  }`}
                 />
               ) : (
                 <pre className="whitespace-pre-wrap font-mono text-xs sm:text-sm text-slate-200 leading-relaxed">
@@ -398,6 +558,85 @@ export function CreationsView({ userRole }: CreationsViewProps) {
                 </pre>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Commit Creation to GitHub Modal */}
+      {publishItem && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-[#11161F] border border-white/[0.1] p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-display text-lg font-semibold text-white">Commit Creation to GitHub</h3>
+              <button
+                type="button"
+                onClick={() => setPublishItem(null)}
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handlePublishGithub} className="space-y-4">
+              <div>
+                <label className="block text-xs text-slate-300 mb-1">Target Repository</label>
+                {loadingRepos ? (
+                  <div className="h-11 rounded-xl bg-[#0A0D12] animate-pulse" />
+                ) : (
+                  <select
+                    required
+                    value={selectedRepo}
+                    onChange={(e) => setSelectedRepo(e.target.value)}
+                    className="w-full h-11 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                  >
+                    {repos.map((r) => (
+                      <option key={r.id} value={r.fullName}>
+                        {r.fullName} ({r.private ? 'Private' : 'Public'})
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-300 mb-1">Repository File Path</label>
+                <input
+                  type="text"
+                  required
+                  value={filePath}
+                  onChange={(e) => setFilePath(e.target.value)}
+                  className="w-full h-11 px-3.5 rounded-xl bg-[#0A0D12] border border-white/[0.1] font-mono text-xs text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-300 mb-1">Commit Message</label>
+                <input
+                  type="text"
+                  required
+                  value={commitMessage}
+                  onChange={(e) => setCommitMessage(e.target.value)}
+                  className="w-full h-11 px-3.5 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setPublishItem(null)}
+                  className="min-h-[40px] px-4 rounded-xl border border-white/[0.1] text-xs text-slate-300 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={publishing || !selectedRepo}
+                  className="min-h-[40px] px-4 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-xs font-medium text-white cursor-pointer"
+                >
+                  {publishing ? 'Committing...' : 'Commit File'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

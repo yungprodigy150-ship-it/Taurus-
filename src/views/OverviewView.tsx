@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { ArrowRight, RefreshCw } from 'lucide-react';
 import type { OverviewPayload, UserRole } from '../../shared/types.ts';
 import type { NavSectionId } from '../components/LayoutShell.tsx';
 import { StatusText } from '../components/StatusText.tsx';
@@ -65,7 +65,7 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
         <button
           type="button"
           onClick={loadOverview}
-          className="mt-4 min-h-[40px] px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] text-xs font-medium text-white cursor-pointer"
+          className="mt-4 min-h-[44px] px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] text-xs font-medium text-white cursor-pointer"
         >
           Retry
         </button>
@@ -83,25 +83,25 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
     {
       label: 'Running Tasks',
       value: data.metrics.runningTasks,
-      sub: `${data.metrics.totalCommands} directives logged`,
+      sub: `${data.metrics.totalExecutionRuns} execution runs`,
       action: () => onNavigate('command'),
     },
     {
       label: 'Completed Tasks',
       value: data.metrics.completedTasks,
-      sub: 'Verified completions',
+      sub: `${data.metrics.totalCommands} directives logged`,
       action: () => onNavigate('command'),
     },
     {
       label: 'Active Projects',
       value: data.metrics.activeProjects,
-      sub: `${data.metrics.totalCreations} creations`,
+      sub: `${data.metrics.totalCreations} creations · ${data.metrics.totalLibraryFiles} files`,
       action: () => onNavigate('projects'),
     },
     {
       label: 'AI Providers',
       value: data.metrics.connectedAiProviders,
-      sub: 'Verified connections',
+      sub: 'Verified model execution',
       action: () => onNavigate('integrations'),
     },
     {
@@ -117,7 +117,7 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
       {/* System Status Header */}
       <section className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-6 border-b border-white/[0.08]">
         <div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <StatusText status={data.systemStatus.health} />
             <span className="text-slate-600" aria-hidden="true">
               ·
@@ -128,8 +128,8 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
             Operations Control Center
           </h2>
           <p className="text-sm text-slate-400 mt-1">
-            Database {data.systemStatus.databaseConnected ? 'connected' : 'unavailable'} · Disk storage{' '}
-            {data.systemStatus.storageAvailable ? 'ready' : 'unavailable'} ·{' '}
+            Database {data.systemStatus.databaseConnected ? 'connected' : 'unavailable'} · Storage{' '}
+            {data.systemStatus.storageAvailable ? 'local container disk' : 'unavailable'} ·{' '}
             <span className="tabular-nums">{data.systemStatus.verifiedProviders}</span> verified integration
             {data.systemStatus.verifiedProviders === 1 ? '' : 's'}
           </p>
@@ -138,7 +138,7 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
         <button
           type="button"
           onClick={loadOverview}
-          className="self-start sm:self-auto min-h-[40px] px-4 rounded-xl border border-white/[0.1] hover:bg-white/[0.04] text-xs font-medium text-slate-200 inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
+          className="self-start sm:self-auto min-h-[44px] px-4 rounded-xl border border-white/[0.1] hover:bg-white/[0.04] text-xs font-medium text-slate-200 inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
         >
           <RefreshCw className="w-3.5 h-3.5" />
           <span>Refresh Telemetry</span>
@@ -148,6 +148,21 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
       {error && (
         <div role="alert" className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
           {error}
+        </div>
+      )}
+
+      {data.metrics.connectedAiProviders === 0 && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <p className="text-xs sm:text-sm text-amber-200">
+            No AI provider is verified yet. Divisions remain on standby until Google Gemini, Groq, or OpenAI passes a live connection check.
+          </p>
+          <button
+            type="button"
+            onClick={() => onNavigate('integrations')}
+            className="self-start sm:self-auto min-h-[38px] px-3.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-xs font-medium text-amber-100 whitespace-nowrap cursor-pointer"
+          >
+            Configure Integrations
+          </button>
         </div>
       )}
 
@@ -167,6 +182,63 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
         ))}
       </section>
 
+      {/* Recent Multi-Agent Execution Runs */}
+      <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] overflow-hidden">
+        <div className="px-5 py-4 border-b border-white/[0.08] flex items-center justify-between gap-3">
+          <div>
+            <h3 className="font-display text-base font-semibold text-white">Recent Execution Runs</h3>
+            <p className="text-xs text-slate-400 mt-0.5">Live multi-agent orchestration runs and token accounting</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigate('command')}
+            className="text-xs font-medium text-[#3B82F6] hover:text-blue-300 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+          >
+            <span>Open Command Center</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {data.recentRuns.length === 0 ? (
+          <div className="p-6 text-sm text-slate-400">
+            No execution runs recorded yet. Submit a plain-language directive in the Command Center to launch an orchestrated run.
+          </div>
+        ) : (
+          <ul className="divide-y divide-white/[0.06]">
+            {data.recentRuns.map((run) => (
+              <li key={run.id} className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <StatusText status={run.status} />
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono text-slate-300">{run.assignedDivisions.join(', ') || 'COMMAND'}</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="tabular-nums">{run.totalTokens.toLocaleString()} tokens</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="tabular-nums">{formatTimestamp(run.startedAt)}</span>
+                  </div>
+                  <div className="text-sm font-medium text-white break-words">
+                    {run.interpretedObjective || run.originalInstruction}
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    Stage: {run.currentStage}
+                    {run.errorMessage ? ` · Error: ${run.errorMessage}` : ''}
+                    {run.remainingWork ? ` · Remaining: ${run.remainingWork}` : ''}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onNavigate('command')}
+                  className="self-start sm:self-auto min-h-[38px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 whitespace-nowrap cursor-pointer"
+                >
+                  Inspect Run
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       {/* Two-Column Operational Feeds */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Tasks Requiring Approval */}
@@ -174,7 +246,7 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
           <div className="px-5 py-4 border-b border-white/[0.08] flex items-center justify-between">
             <div>
               <h3 className="font-display text-base font-semibold text-white">Tasks Requiring Approval</h3>
-              <p className="text-xs text-slate-400 mt-0.5">Actions gated by operator policy</p>
+              <p className="text-xs text-slate-400 mt-0.5">External or gated operations awaiting sign-off</p>
             </div>
             <span className="font-mono text-xs text-slate-400 tabular-nums">{data.pendingApprovals.length}</span>
           </div>
@@ -204,15 +276,15 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
                         type="button"
                         disabled={busyTaskId === task.id}
                         onClick={() => handleApprovalDecision(task.id, 'approve')}
-                        className="min-h-[38px] px-3.5 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-xs font-medium text-white cursor-pointer"
+                        className="min-h-[40px] px-3.5 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-xs font-medium text-white cursor-pointer"
                       >
-                        Approve
+                        Approve & Execute
                       </button>
                       <button
                         type="button"
                         disabled={busyTaskId === task.id}
                         onClick={() => handleApprovalDecision(task.id, 'reject')}
-                        className="min-h-[38px] px-3.5 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] disabled:opacity-50 text-xs font-medium text-slate-300 cursor-pointer"
+                        className="min-h-[40px] px-3.5 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] disabled:opacity-50 text-xs font-medium text-slate-300 cursor-pointer"
                       >
                         Reject
                       </button>
@@ -238,13 +310,13 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
               onClick={() => onNavigate('settings')}
               className="text-xs font-medium text-[#3B82F6] hover:text-blue-300 cursor-pointer"
             >
-              Full Logs
+              Full Logs & Backup
             </button>
           </div>
 
           {data.recentActivity.length === 0 ? (
             <div className="p-6 text-sm text-slate-400">
-              No operational events recorded yet. Create a project, test an integration, or submit a directive in the
+              No operational events recorded yet. Create a project, verify an AI provider, or submit a directive in the
               Command Center.
             </div>
           ) : (
@@ -252,7 +324,7 @@ export function OverviewView({ userRole, onNavigate }: OverviewViewProps) {
               {data.recentActivity.map((entry) => (
                 <li key={entry.id} className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
                       <StatusText status={entry.level} label={entry.subsystem} />
                       <span aria-hidden="true">·</span>
                       <span className="font-mono text-[11px] text-slate-500">{entry.action}</span>

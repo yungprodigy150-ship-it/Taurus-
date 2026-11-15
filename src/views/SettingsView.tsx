@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Shield, UserPlus } from 'lucide-react';
-import type { UserProfile, UserRole } from '../../shared/types.ts';
+import { Download, Shield, UserPlus } from 'lucide-react';
+import type { AiExecutionAuditRecord, UserProfile, UserRole } from '../../shared/types.ts';
 import { StatusText } from '../components/StatusText.tsx';
 import { api, ApiError, formatBytes, formatTimestamp } from '../lib/api.ts';
 
@@ -21,8 +21,11 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
     storageDirectory: string;
     storageFileCount: number;
     storageTotalBytes: number;
+    storageDurability?: string;
+    durabilityNotice?: string;
     encryptionAlgorithm: string;
   } | null>(null);
+  const [aiExecutions, setAiExecutions] = useState<AiExecutionAuditRecord[]>([]);
   const [logs, setLogs] = useState<
     Array<{
       id: string;
@@ -41,6 +44,7 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState<UserRole>('operator');
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const isOwner = currentUser.role === 'owner';
@@ -51,6 +55,7 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
       const settingsRes = await api.settings.get();
       setPolicy(settingsRes.policy);
       setInfra(settingsRes.infrastructure);
+      setAiExecutions(settingsRes.aiExecutions || []);
       setLogs(settingsRes.logs);
 
       if (isOwner) {
@@ -76,6 +81,19 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
       setPolicy(res.policy as typeof policy);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to update policy.');
+    }
+  }
+
+  async function handleExportBackup() {
+    if (!isOwner) return;
+    setExporting(true);
+    setError(null);
+    try {
+      await api.settings.downloadBackup();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Failed to export workspace backup.');
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -128,14 +146,14 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
             <div>
               <div className="text-sm text-white">Require Owner Approval for External Actions</div>
               <div className="text-xs text-slate-400">
-                Gates high-risk and Phase 2 external tasks behind human sign-off.
+                Gates GitHub repo creation, outbound email, and external operations behind Owner approval.
               </div>
             </div>
             <button
               type="button"
               disabled={!isOwner}
               onClick={handleToggleApprovalPolicy}
-              className={`min-h-[36px] px-3.5 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50 ${
+              className={`min-h-[38px] px-3.5 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50 ${
                 policy.requireApprovalForExternalActions
                   ? 'bg-[#2563EB] text-white'
                   : 'border border-white/[0.1] text-slate-300'
@@ -145,33 +163,54 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
             </button>
           </div>
           <div className="text-xs text-slate-400">
-            Platform Phase: <span className="text-slate-200">{policy.platformPhase || 'Phase 1: System Foundation'}</span>
+            Platform Phase: <span className="text-slate-200">{policy.platformPhase || 'Phase 2: Intelligence & Orchestration'}</span>
           </div>
         </section>
 
-        <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] p-5 space-y-3">
-          <h2 className="font-display text-base font-semibold text-white">Storage & Runtime Diagnostics</h2>
+        <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] p-5 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="font-display text-base font-semibold text-white">Storage & Runtime Diagnostics</h2>
+            {isOwner && (
+              <button
+                type="button"
+                disabled={exporting}
+                onClick={handleExportBackup}
+                className="min-h-[36px] px-3 rounded-lg border border-white/[0.1] hover:bg-white/[0.05] text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{exporting ? 'Exporting...' : 'Export Backup'}</span>
+              </button>
+            )}
+          </div>
+
           {infra ? (
-            <dl className="grid grid-cols-2 gap-3 text-xs">
-              <div>
-                <dt className="text-slate-500">Database Engine</dt>
-                <dd className="text-slate-200 mt-0.5">{infra.databaseEngine}</dd>
-              </div>
-              <div>
-                <dt className="text-slate-500">Database Size</dt>
-                <dd className="text-slate-200 font-mono tabular-nums mt-0.5">{formatBytes(infra.databaseSizeBytes)}</dd>
-              </div>
-              <div>
-                <dt className="text-slate-500">File Storage</dt>
-                <dd className="text-slate-200 font-mono tabular-nums mt-0.5">
-                  {infra.storageFileCount} files ({formatBytes(infra.storageTotalBytes)})
-                </dd>
-              </div>
-              <div>
-                <dt className="text-slate-500">Vault Encryption</dt>
-                <dd className="text-slate-200 font-mono mt-0.5">{infra.encryptionAlgorithm}</dd>
-              </div>
-            </dl>
+            <>
+              <dl className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <dt className="text-slate-500">Database Engine</dt>
+                  <dd className="text-slate-200 mt-0.5">{infra.databaseEngine}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Database Size</dt>
+                  <dd className="text-slate-200 font-mono tabular-nums mt-0.5">{formatBytes(infra.databaseSizeBytes)}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">File Storage</dt>
+                  <dd className="text-slate-200 font-mono tabular-nums mt-0.5">
+                    {infra.storageFileCount} files ({formatBytes(infra.storageTotalBytes)})
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Vault Encryption</dt>
+                  <dd className="text-slate-200 font-mono mt-0.5">{infra.encryptionAlgorithm}</dd>
+                </div>
+              </dl>
+              {infra.durabilityNotice && (
+                <p className="text-xs text-amber-300/90 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 leading-relaxed">
+                  {infra.durabilityNotice}
+                </p>
+              )}
+            </>
           ) : (
             <div className="h-20 rounded-xl bg-[#0A0D12] animate-pulse" />
           )}
@@ -256,6 +295,39 @@ export function SettingsView({ currentUser }: SettingsViewProps) {
           </form>
         </section>
       )}
+
+      {/* AI Provider Execution Telemetry */}
+      <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] overflow-hidden">
+        <div className="px-5 py-4 border-b border-white/[0.08] flex items-center justify-between">
+          <h2 className="font-display text-base font-semibold text-white">AI Provider Execution Telemetry</h2>
+          <span className="text-xs font-mono text-slate-400 tabular-nums">{aiExecutions.length} recent calls</span>
+        </div>
+        {aiExecutions.length === 0 ? (
+          <div className="p-6 text-sm text-slate-400">No routed AI executions recorded yet.</div>
+        ) : (
+          <div className="divide-y divide-white/[0.06] max-h-64 overflow-y-auto">
+            {aiExecutions.map((ex) => (
+              <div key={ex.id} className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusText status={ex.status} label={ex.division} />
+                    <span className="font-mono text-blue-300">
+                      {ex.providerKey}/{ex.modelName}
+                    </span>
+                    <span className="text-slate-400">
+                      {ex.taskCategory} · {ex.complexity}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-slate-400 truncate">{ex.routingReason}</p>
+                </div>
+                <div className="font-mono text-slate-400 tabular-nums shrink-0">
+                  {ex.totalTokens} tok · {ex.latencyMs} ms
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {/* Persistent Execution Audit Logs */}
       <section className="rounded-2xl bg-[#11161F] border border-white/[0.08] overflow-hidden">

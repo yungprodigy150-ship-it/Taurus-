@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Plus, SlidersHorizontal, X } from 'lucide-react';
+import { Play, Plus, SlidersHorizontal, X } from 'lucide-react';
 import type {
   AgentRecord,
   DivisionCode,
@@ -45,11 +45,26 @@ export function AgentsView({ userRole }: AgentsViewProps) {
     tasks: TaskRecord[];
     history: ExecutionLogRecord[];
   } | null>(null);
+
+  // Direct execution
+  const [execTitle, setExecTitle] = useState('');
+  const [execObjective, setExecObjective] = useState('');
+  const [execProjectId, setExecProjectId] = useState('');
+  const [executing, setExecuting] = useState(false);
+  const [execResult, setExecResult] = useState<{
+    outputSummary: string;
+    providerKey: string;
+    modelName: string;
+    tokensUsed: number;
+    latencyMs: number;
+  } | null>(null);
+
+  // Assign queued task
   const [taskTitle, setTaskTitle] = useState('');
   const [taskProjectId, setTaskProjectId] = useState('');
   const [taskApproval, setTaskApproval] = useState(false);
 
-  const [editProvider, setEditProvider] = useState('unassigned');
+  const [editProvider, setEditProvider] = useState('auto_routed');
   const [editStatus, setEditStatus] = useState<AgentRecord['status']>('standby');
 
   const canMutate = userRole === 'owner' || userRole === 'operator';
@@ -73,6 +88,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
 
   async function openAgentDetails(id: string) {
     setSelectedAgentId(id);
+    setExecResult(null);
     setError(null);
     try {
       const data = await api.agents.details(id);
@@ -117,7 +133,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
     try {
       await api.agents.update(detailData.agent.id, {
         modelProvider: editProvider,
-        modelName: editProvider === 'google_gemini' ? 'gemini-4-hydrogen' : 'none',
+        modelName: editProvider === 'auto_routed' ? 'intelligent_router' : detailData.agent.modelName,
         status: editStatus,
       });
       await openAgentDetails(detailData.agent.id);
@@ -126,6 +142,30 @@ export function AgentsView({ userRole }: AgentsViewProps) {
       setError(err instanceof ApiError ? err.message : 'Failed to update agent configuration.');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleExecuteNow(e: FormEvent) {
+    e.preventDefault();
+    if (!detailData || !execTitle.trim()) return;
+    setExecuting(true);
+    setError(null);
+    setExecResult(null);
+    try {
+      const res = await api.agents.executeTask(detailData.agent.id, {
+        title: execTitle.trim(),
+        objective: execObjective.trim() || undefined,
+        projectId: execProjectId || null,
+      });
+      setExecResult(res.result);
+      setExecTitle('');
+      setExecObjective('');
+      await openAgentDetails(detailData.agent.id);
+      await loadAgents();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Direct division execution failed.');
+    } finally {
+      setExecuting(false);
     }
   }
 
@@ -160,7 +200,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
         <div>
           <h2 className="font-display text-xl font-semibold text-white">Operational Divisions & Agents</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Phase 1 architecture registry. Autonomous division execution engines activate in Phase 2.
+            Specialized AI divisions equipped with intelligent model routing, deliverable storage, and direct execution. Agents activate automatically when at least one AI provider is verified.
           </p>
         </div>
 
@@ -187,7 +227,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
         <button
           type="button"
           onClick={() => setDivisionFilter('ALL')}
-          className={`min-h-[36px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
+          className={`min-h-[38px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
             divisionFilter === 'ALL' ? 'bg-white text-slate-900' : 'bg-[#11161F] text-slate-400 hover:text-white'
           }`}
         >
@@ -198,7 +238,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
             key={div}
             type="button"
             onClick={() => setDivisionFilter(div)}
-            className={`min-h-[36px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
+            className={`min-h-[38px] px-3 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer ${
               divisionFilter === div ? 'bg-white text-slate-900' : 'bg-[#11161F] text-slate-400 hover:text-white'
             }`}
           >
@@ -232,16 +272,20 @@ export function AgentsView({ userRole }: AgentsViewProps) {
 
               <div className="pt-3 border-t border-white/[0.06] flex items-center justify-between gap-2 text-xs text-slate-400">
                 <span className="truncate">
-                  {agent.runtimeMode === 'intake_assisted' ? 'AI Intake Assisted' : 'Architecture Standby'} ·{' '}
-                  <span className="tabular-nums">{agent.assignedTaskCount ?? 0}</span> tasks
+                  {agent.runtimeMode === 'ai_orchestrated'
+                    ? 'AI Orchestrated'
+                    : agent.runtimeMode === 'intake_assisted'
+                      ? 'AI Intake Assisted'
+                      : 'Standby'}{' '}
+                  · <span className="tabular-nums">{agent.completedTaskCount ?? 0}</span> done
                 </span>
                 <button
                   type="button"
                   onClick={() => openAgentDetails(agent.id)}
-                  className="min-h-[36px] px-3 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-white inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  className="min-h-[38px] px-3 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-white inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
                 >
                   <SlidersHorizontal className="w-3.5 h-3.5" />
-                  <span>Inspect</span>
+                  <span>Inspect & Run</span>
                 </button>
               </div>
             </div>
@@ -335,15 +379,22 @@ export function AgentsView({ userRole }: AgentsViewProps) {
         </div>
       )}
 
-      {/* Agent Detail & Config Drawer */}
+      {/* Agent Detail, Execution & Config Drawer */}
       {selectedAgentId && detailData && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex justify-end">
           <div className="w-full max-w-xl bg-[#11161F] border-l border-white/[0.1] h-full overflow-y-auto p-6 space-y-6">
             <div className="flex items-start justify-between gap-4 pb-4 border-b border-white/[0.08]">
               <div>
-                <div className="text-xs font-mono text-slate-400">{detailData.agent.division}</div>
+                <div className="text-xs font-mono text-slate-400">
+                  {detailData.agent.division} · {detailData.agent.runtimeMode.replace(/_/g, ' ')}
+                </div>
                 <h3 className="font-display text-xl font-semibold text-white mt-1">{detailData.agent.name}</h3>
                 <p className="text-xs text-slate-400 mt-1">{detailData.agent.responsibilities}</p>
+                {detailData.agent.capabilities.length > 0 && (
+                  <p className="text-[11px] font-mono text-slate-500 mt-2">
+                    Capabilities: {detailData.agent.capabilities.join(' · ')}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
@@ -357,9 +408,63 @@ export function AgentsView({ userRole }: AgentsViewProps) {
               </button>
             </div>
 
+            {/* Direct AI Task Execution */}
+            {canMutate && (
+              <form onSubmit={handleExecuteNow} className="space-y-3 pb-5 border-b border-white/[0.08]">
+                <h4 className="text-sm font-semibold text-white">Execute Task Immediately</h4>
+                <input
+                  type="text"
+                  required
+                  value={execTitle}
+                  onChange={(e) => setExecTitle(e.target.value)}
+                  placeholder={`Give ${detailData.agent.division} an immediate deliverable or analysis task...`}
+                  className="w-full h-10 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                />
+                <textarea
+                  rows={2}
+                  value={execObjective}
+                  onChange={(e) => setExecObjective(e.target.value)}
+                  placeholder="Optional details, URLs to inspect (for ATLAS), or output requirements..."
+                  className="w-full px-3 py-2 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                />
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <select
+                    value={execProjectId}
+                    onChange={(e) => setExecProjectId(e.target.value)}
+                    className="flex-1 h-10 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
+                  >
+                    <option value="">No project linked</option>
+                    {projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="submit"
+                    disabled={executing || !execTitle.trim()}
+                    className="min-h-[40px] px-4 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-xs font-medium text-white inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    <span>{executing ? 'Executing...' : 'Run via Division'}</span>
+                  </button>
+                </div>
+
+                {execResult && (
+                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3.5 space-y-1.5">
+                    <div className="text-[11px] font-mono text-emerald-300">
+                      Completed via {execResult.providerKey}/{execResult.modelName} · {execResult.tokensUsed} tokens ·{' '}
+                      {execResult.latencyMs} ms
+                    </div>
+                    <div className="text-xs text-slate-200 whitespace-pre-wrap">{execResult.outputSummary}</div>
+                  </div>
+                )}
+              </form>
+            )}
+
             {canMutate && (
               <form onSubmit={handleUpdateConfig} className="space-y-3 pb-5 border-b border-white/[0.08]">
-                <h4 className="text-sm font-semibold text-white">Agent Configuration</h4>
+                <h4 className="text-sm font-semibold text-white">Agent Routing & Status</h4>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">Provider Binding</label>
@@ -368,10 +473,11 @@ export function AgentsView({ userRole }: AgentsViewProps) {
                       onChange={(e) => setEditProvider(e.target.value)}
                       className="w-full h-10 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
                     >
-                      <option value="unassigned">Unassigned</option>
+                      <option value="auto_routed">Intelligent Router (Recommended)</option>
                       <option value="google_gemini">Google Gemini</option>
                       <option value="groq">Groq</option>
                       <option value="openai">OpenAI</option>
+                      <option value="unassigned">Unassigned</option>
                     </select>
                   </div>
                   <div>
@@ -381,7 +487,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
                       onChange={(e) => setEditStatus(e.target.value as AgentRecord['status'])}
                       className="w-full h-10 px-3 rounded-xl bg-[#0A0D12] border border-white/[0.1] text-xs text-white"
                     >
-                      <option value="standby">Standby (Architecture Only)</option>
+                      <option value="standby">Standby</option>
                       <option value="configured">Configured</option>
                       <option value="active">Active (Requires Verified Provider)</option>
                       <option value="disabled">Disabled</option>
@@ -391,7 +497,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
                 <button
                   type="submit"
                   disabled={saving}
-                  className="min-h-[38px] px-4 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-medium text-white cursor-pointer"
+                  className="min-h-[38px] px-4 rounded-xl border border-white/[0.15] hover:bg-white/[0.05] text-xs font-medium text-white cursor-pointer"
                 >
                   Save Configuration
                 </button>
@@ -400,7 +506,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
 
             {canMutate && (
               <form onSubmit={handleAssignTask} className="space-y-3 pb-5 border-b border-white/[0.08]">
-                <h4 className="text-sm font-semibold text-white">Assign Task</h4>
+                <h4 className="text-sm font-semibold text-white">Queue Persistent Task</h4>
                 <input
                   type="text"
                   required
@@ -437,7 +543,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
                   disabled={saving}
                   className="min-h-[38px] px-4 rounded-xl border border-white/[0.15] hover:bg-white/[0.05] text-xs font-medium text-white cursor-pointer"
                 >
-                  Assign Task
+                  Queue Task
                 </button>
               </form>
             )}
@@ -455,6 +561,7 @@ export function AgentsView({ userRole }: AgentsViewProps) {
                         <span className="text-slate-500 tabular-nums">{formatTimestamp(t.createdAt)}</span>
                       </div>
                       <div className="mt-1 text-sm text-white">{t.title}</div>
+                      {t.resultNotes && <p className="mt-1 text-xs text-slate-400 line-clamp-3">{t.resultNotes}</p>}
                     </li>
                   ))}
                 </ul>

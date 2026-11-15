@@ -27,20 +27,24 @@ function mapProject(r: Record<string, unknown>): ProjectRecord {
   };
 }
 
-projectsRouter.get('/', (_req, res) => {
+projectsRouter.get('/', (req: AuthenticatedRequest, res) => {
   const db = getDb();
-  const rows = db
-    .prepare(`
-      SELECT p.*, u.name as owner_name,
-        (SELECT COUNT(*) FROM commands c WHERE c.project_id = p.id) as command_count,
-        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-        (SELECT COUNT(*) FROM creations cr WHERE cr.project_id = p.id) as creation_count,
-        (SELECT COUNT(*) FROM library_files lf WHERE lf.project_id = p.id) as file_count
-      FROM projects p
-      LEFT JOIN users u ON u.id = p.owner_id
-      ORDER BY CASE WHEN p.status = 'archived' THEN 1 ELSE 0 END, p.updated_at DESC
-    `)
-    .all() as Array<Record<string, unknown>>;
+  const isOwner = req.user!.role === 'owner';
+  const baseSql = `
+    SELECT p.*, u.name as owner_name,
+      (SELECT COUNT(*) FROM commands c WHERE c.project_id = p.id) as command_count,
+      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
+      (SELECT COUNT(*) FROM creations cr WHERE cr.project_id = p.id) as creation_count,
+      (SELECT COUNT(*) FROM library_files lf WHERE lf.project_id = p.id) as file_count
+    FROM projects p
+    LEFT JOIN users u ON u.id = p.owner_id
+    ${isOwner ? '' : 'WHERE p.owner_id = ?'}
+    ORDER BY CASE WHEN p.status = 'archived' THEN 1 ELSE 0 END, p.updated_at DESC
+  `;
+
+  const rows = (isOwner ? db.prepare(baseSql).all() : db.prepare(baseSql).all(req.user!.id)) as Array<
+    Record<string, unknown>
+  >;
 
   res.json({ projects: rows.map(mapProject) });
 });
@@ -95,7 +99,7 @@ projectsRouter.patch('/:id', requireRole(['owner', 'operator']), (req: Authentic
 
   const db = getDb();
   const existing = db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-  if (!existing) {
+  if (!existing || (req.user!.role !== 'owner' && String(existing.owner_id) !== req.user!.id)) {
     res.status(404).json({ error: 'Project not found.' });
     return;
   }
@@ -145,12 +149,14 @@ projectsRouter.patch('/:id', requireRole(['owner', 'operator']), (req: Authentic
   res.json({ project: mapProject(updated) });
 });
 
-projectsRouter.get('/:id/history', (req, res) => {
+projectsRouter.get('/:id/history', (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
   const db = getDb();
 
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
-  if (!project) {
+  const project = db.prepare('SELECT id, owner_id FROM projects WHERE id = ?').get(id) as
+    | { id: string; owner_id: string }
+    | undefined;
+  if (!project || (req.user!.role !== 'owner' && project.owner_id !== req.user!.id)) {
     res.status(404).json({ error: 'Project not found.' });
     return;
   }

@@ -29,9 +29,12 @@ function mapCreation(r: Record<string, unknown>): CreationRecord {
     projectId: r.project_id ? String(r.project_id) : null,
     projectName: r.project_name ? String(r.project_name) : null,
     commandId: r.command_id ? String(r.command_id) : null,
+    executionRunId: r.execution_run_id ? String(r.execution_run_id) : null,
     contentType: r.content_type as CreationContentType,
     contentBody: String(r.content_body || ''),
     libraryFileId: r.library_file_id ? String(r.library_file_id) : null,
+    deployedUrl: r.deployed_url ? String(r.deployed_url) : null,
+    isInteractive: Boolean(r.is_interactive) || r.content_type === 'html',
     status: r.status as CreationRecord['status'],
     createdBy: String(r.created_by),
     createdAt: String(r.created_at),
@@ -39,29 +42,33 @@ function mapCreation(r: Record<string, unknown>): CreationRecord {
   };
 }
 
-creationsRouter.get('/', (req, res) => {
+creationsRouter.get('/', (req: AuthenticatedRequest, res) => {
   const category = typeof req.query.category === 'string' ? req.query.category : null;
   const db = getDb();
-  const rows = (
-    category && VALID_CATEGORIES.includes(category as CreationCategory)
-      ? db
-          .prepare(`
-            SELECT c.*, p.name as project_name
-            FROM creations c
-            LEFT JOIN projects p ON p.id = c.project_id
-            WHERE c.category = ?
-            ORDER BY c.updated_at DESC
-          `)
-          .all(category)
-      : db
-          .prepare(`
-            SELECT c.*, p.name as project_name
-            FROM creations c
-            LEFT JOIN projects p ON p.id = c.project_id
-            ORDER BY c.updated_at DESC
-          `)
-          .all()
-  ) as Array<Record<string, unknown>>;
+  const isOwner = req.user!.role === 'owner';
+
+  const conditions: string[] = [];
+  const params: string[] = [];
+
+  if (!isOwner) {
+    conditions.push('c.created_by = ?');
+    params.push(req.user!.id);
+  }
+  if (category && VALID_CATEGORIES.includes(category as CreationCategory)) {
+    conditions.push('c.category = ?');
+    params.push(category);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`
+      SELECT c.*, p.name as project_name
+      FROM creations c
+      LEFT JOIN projects p ON p.id = c.project_id
+      ${where}
+      ORDER BY c.updated_at DESC
+    `)
+    .all(...params) as Array<Record<string, unknown>>;
 
   res.json({ creations: rows.map(mapCreation) });
 });
@@ -90,10 +97,10 @@ creationsRouter.post('/', requireRole(['owner', 'operator']), (req: Authenticate
 
   db.prepare(`
     INSERT INTO creations (
-      id, title, category, description, project_id, command_id,
-      content_type, content_body, library_file_id, status,
+      id, title, category, description, project_id, command_id, execution_run_id,
+      content_type, content_body, library_file_id, deployed_url, is_interactive, status,
       created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, 'ready', ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, 'ready', ?, ?, ?)
   `).run(
     id,
     title.trim(),
@@ -102,6 +109,7 @@ creationsRouter.post('/', requireRole(['owner', 'operator']), (req: Authenticate
     projectId || null,
     targetType,
     contentBody || '',
+    targetType === 'html' ? 1 : 0,
     req.user!.id,
     now,
     now
@@ -124,21 +132,22 @@ creationsRouter.post('/', requireRole(['owner', 'operator']), (req: Authenticate
   res.status(201).json({ creation: mapCreation(row) });
 });
 
-creationsRouter.get('/:id/download', (req, res) => {
+creationsRouter.get('/:id/download', (req: AuthenticatedRequest, res) => {
   const db = getDb();
   const row = db.prepare('SELECT * FROM creations WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
-  if (!row) {
+  if (!row || (req.user!.role !== 'owner' && String(row.created_by) !== req.user!.id)) {
     res.status(404).json({ error: 'Creation not found.' });
     return;
   }
 
   const contentType = String(row.content_type);
-  const titleSlug = String(row.title)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '') || 'taurus-creation';
+  const titleSlug =
+    String(row.title)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'taurus-creation';
 
   const ext =
     contentType === 'html' ? 'html' : contentType === 'markdown' ? 'md' : contentType === 'json' ? 'json' : 'txt';
@@ -156,11 +165,15 @@ creationsRouter.get('/:id/download', (req, res) => {
 
 creationsRouter.delete('/:id', requireRole(['owner', 'operator']), (req: AuthenticatedRequest, res) => {
   const db = getDb();
-  const result = db.prepare('DELETE FROM creations WHERE id = ?').run(req.params.id);
-  if (result.changes === 0) {
+  const existing = db.prepare('SELECT created_by FROM creations WHERE id = ?').get(req.params.id) as
+    | { created_by: string }
+    | undefined;
+  if (!existing || (req.user!.role !== 'owner' && existing.created_by !== req.user!.id)) {
     res.status(404).json({ error: 'Creation not found.' });
     return;
   }
+
+  db.prepare('DELETE FROM creations WHERE id = ?').run(req.params.id);
   logEvent({
     level: 'warn',
     subsystem: 'FORGE',
